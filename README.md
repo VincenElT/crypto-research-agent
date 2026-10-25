@@ -120,8 +120,8 @@ python -m crypto_research.backtest --csv-file path/to/candles.csv --symbols BTC/
 - **Total Return**: Cumulative percent gain or loss based on final equity vs initial cash.
 - **Buy & Hold Benchmark**: Return of an equal-weighted buy-and-hold strategy across the tested symbols from period start to end.
 - **Max Drawdown**: Maximum peak-to-trough drop in total equity across the timeline.
-- **Completed Trades**: Number of closed round-trip trades (sell executions realizing P&L).
-- **Win Rate**: Percentage of completed trades with positive net realized P&L after fees.
+- **Realized Exit Tranches**: Number of sell executions realizing P&L; a partial exit counts as its own tranche.
+- **Win Rate**: Percentage of exit tranches with positive net realized P&L after allocated entry fees, exit fees, and modeled slippage.
 - **Profit Factor**: Gross profits divided by gross losses. Displays `inf (no losses)` if all trades are profitable.
 - **Execution History**: Chronological log of simulated fills with exact fees, slippage, and P&L.
 
@@ -131,6 +131,12 @@ python -m crypto_research.backtest --csv-file path/to/candles.csv --symbols BTC/
 2. **Spot Long-Only**: Sells require existing holdings. Short-selling without inventory is strictly rejected.
 3. **Fills & Liquidity**: Fills assume full execution at the adjusted open price; intrabar orderbook queue priority and market depth slippage curves are not simulated.
 4. **State Isolation**: Backtests write to `account_id=f"backtest_{run_id}"`, preserving the normal paper-trading account intact.
+
+5. **Trade P&L Cost Allocation**: Backtest trade statistics treat each sell execution as a realized exit tranche. Buy fees are allocated pro rata by quantity across exits from the symbol's pooled average-cost position; any fee portion for unsold quantity remains with open inventory. Buy slippage is already in the buy fill/cost basis, while sell slippage and sell fees are already in sell proceeds. These costs are not deducted again from portfolio equity, which remains cash plus marked position value.
+
+6. **Evaluation Cutoff and Benchmarks**: The evaluation harness supports daily candles only. Candle timestamps label bar opens; close-derived signals are eligible only after that candle closes, at the next UTC midnight. An inclusive period end-date includes the candle with that UTC open-date, whose close is available at the following midnight. Signals without a following candle open remain unexecuted. BTC benchmarks are gross of transaction costs; the exposure-matched benchmark holds a constant target weight and rebalances daily.
+
+7. **Historical Data Integrity**: OHLC relationships, finite nonnegative volume, unique increasing source timestamps, and contiguous candle spacing are required. A gap greater than 1.5 times the configured timeframe is rejected; invalid input never falls back to synthetic data.
 
 ## Tests
 

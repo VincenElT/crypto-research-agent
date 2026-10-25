@@ -333,14 +333,17 @@ def fetch_ohlcv(
 
     timeframe_ms = int(client.parse_timeframe(settings.timeframe) * 1000)
     raw = _fetch_ohlcv_with_retries(client, settings)
+    source_times = [int(row[0]) for row in raw]
+    if any(right <= left for left, right in zip(source_times, source_times[1:])):
+        raise MarketDataError("Market data timestamps must be unique and strictly increasing.")
     frame = ohlcv_to_dataframe(raw)
     if frame.empty:
         raise MarketDataError(
             f"No OHLCV data returned for {settings.symbol} on {settings.exchange_id}."
         )
-    if frame[["open", "high", "low", "close"]].isna().any().any():
+    if frame[["open", "high", "low", "close", "volume"]].isna().any().any():
         raise MarketDataError(
-            "Market data contained non-numeric OHLC values and cannot be used."
+            "Market data contained non-numeric OHLCV values and cannot be used."
         )
     numeric_ohlc = frame[["open", "high", "low", "close"]].to_numpy()
     if np.isinf(numeric_ohlc).any():
@@ -351,9 +354,22 @@ def fetch_ohlcv(
         raise MarketDataError(
             "Market data contained non-positive OHLC prices and cannot be used."
         )
+    numeric_volume = frame["volume"].to_numpy()
+    if not np.isfinite(numeric_volume).all() or (numeric_volume < 0).any():
+        raise MarketDataError(
+            "Market data contained non-finite or negative volume and cannot be used."
+        )
     if (frame["high"] < frame["low"]).any():
         raise MarketDataError(
             "Market data contained invalid candles where high was lower than low."
+        )
+    if (frame["high"] < frame[["open", "close"]].max(axis=1)).any():
+        raise MarketDataError(
+            "Market data contained a high below open or close and cannot be used."
+        )
+    if (frame["low"] > frame[["open", "close"]].min(axis=1)).any():
+        raise MarketDataError(
+            "Market data contained a low above open or close and cannot be used."
         )
 
     closed = drop_incomplete_candle(frame, timeframe_ms)

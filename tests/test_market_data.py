@@ -87,6 +87,31 @@ def test_fetch_ohlcv_rejects_inverted_high_low() -> None:
         fetch_ohlcv(_settings(), exchange=exchange)
 
 
+@pytest.mark.parametrize(
+    "row, message",
+    [
+        ([1704067200000, 100.0, 99.0, 95.0, 100.0, 1.0], "high below open or close"),
+        ([1704067200000, 100.0, 105.0, 101.0, 100.0, 1.0], "low above open or close"),
+        ([1704067200000, 100.0, 105.0, 95.0, 100.0, -1.0], "negative volume"),
+        ([1704067200000, 100.0, 105.0, 95.0, 100.0, float("inf")], "non-finite or negative volume"),
+    ],
+)
+def test_fetch_rejects_invalid_ohlc_and_volume(row: list[Any], message: str) -> None:
+    with pytest.raises(MarketDataError, match=message):
+        fetch_ohlcv(_settings(), exchange=_mock_exchange([row]))
+
+
+def test_fetch_rejects_duplicate_and_non_monotonic_source_timestamps() -> None:
+    first = int(datetime(2024, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
+    second = first + 86_400_000
+    for rows in (
+        [[first, 100, 105, 95, 100, 1], [first, 100, 105, 95, 100, 1]],
+        [[second, 100, 105, 95, 100, 1], [first, 100, 105, 95, 100, 1]],
+    ):
+        with pytest.raises(MarketDataError, match="timestamps must be unique and strictly increasing"):
+            fetch_ohlcv(_settings(), exchange=_mock_exchange(rows))
+
+
 # =========================================================================
 # Tests for BinanceVisionClient (Response parsing, pagination, errors, TLS)
 # =========================================================================

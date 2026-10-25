@@ -255,6 +255,64 @@ class BacktestReport:
     equity_curve: list[dict[str, Any]]
     symbol_breakdown: dict[str, dict[str, Any]]
     execution_history: list[dict[str, Any]]
+    completed_trade_records: list[dict[str, Any]]
+
+
+def allocate_entry_fees_to_exits(
+    execution_history: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, float]]:
+    """Return sell-tranche P&L after allocating buy fees by quantity.
+
+    Buys add quantity and their fees to a symbol-level average-cost pool. Each
+    sell allocates the same fraction of that pool as the fraction of inventory
+    sold. Buy slippage is already included in the buy fill price and hence in
+    ``cost_basis_sold_usd``; sell slippage and sell fees are already included
+    in the execution's realized P&L. This helper therefore deducts only the
+    allocated entry fee and does not change cash or portfolio equity.
+
+    Each sell execution is reported as one realized exit tranche. Remaining
+    entry fees are returned by symbol for the still-open inventory.
+    """
+    open_quantity: dict[str, float] = {}
+    open_entry_fees: dict[str, float] = {}
+    net_exits: list[dict[str, Any]] = []
+
+    for execution in execution_history:
+        symbol = str(execution["symbol"])
+        quantity = float(execution["quantity"])
+        if execution["action"] == "BUY":
+            open_quantity[symbol] = open_quantity.get(symbol, 0.0) + quantity
+            open_entry_fees[symbol] = open_entry_fees.get(symbol, 0.0) + float(
+                execution.get("fee_usd", 0.0)
+            )
+            continue
+
+        if execution["action"] != "SELL":
+            continue
+
+        held_quantity = open_quantity.get(symbol, 0.0)
+        if held_quantity <= 0.0 or quantity > held_quantity + 1e-9:
+            raise BacktestError(
+                f"Cannot allocate entry costs for {symbol} sell of {quantity} "
+                f"against open quantity {held_quantity}."
+            )
+        allocated_fee = open_entry_fees.get(symbol, 0.0) * min(1.0, quantity / held_quantity)
+        net_pnl = float(execution["realized_pnl_usd"]) - allocated_fee
+        net_exits.append(
+            {
+                **execution,
+                "allocated_entry_fee_usd": allocated_fee,
+                "net_realized_pnl_usd": net_pnl,
+                # Keep the historical field but make it reflect the all-in
+                # net value used by the trade metrics.
+                "realized_pnl_usd": net_pnl,
+            }
+        )
+        remaining_fraction = max(0.0, (held_quantity - quantity) / held_quantity)
+        open_quantity[symbol] = max(0.0, held_quantity - quantity)
+        open_entry_fees[symbol] = open_entry_fees.get(symbol, 0.0) * remaining_fraction
+
+    return net_exits, open_entry_fees
 
 
 def validate_backtest_candles(
@@ -271,20 +329,28 @@ def validate_backtest_candles(
 
     frame = candles.copy()
     frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
-    frame = frame.sort_values("timestamp").reset_index(drop=True)
 
-    # Check timestamp uniqueness and monotonicity
+    # Validate source order before doing any ordering. Sorting here would hide
+    # a broken or shuffled input sequence and undermine reproducibility.
+    if frame["timestamp"].isna().any():
+        raise MarketDataError(f"Invalid timestamp in candle series for {symbol}.")
     if frame["timestamp"].duplicated().any():
         dup_ts = frame[frame["timestamp"].duplicated()]["timestamp"].iloc[0]
         raise MarketDataError(
             f"Duplicate timestamp {dup_ts.isoformat()} in candle series for {symbol}."
         )
+    if not frame["timestamp"].is_monotonic_increasing:
+        raise MarketDataError(f"Non-monotonic timestamps in candle series for {symbol}.")
+    frame = frame.reset_index(drop=True)
 
     # Validate numeric integrity
     for col in ("open", "high", "low", "close", "volume"):
         frame[col] = pd.to_numeric(frame[col], errors="coerce")
         if frame[col].isna().any():
             raise MarketDataError(f"Non-numeric values in {col} column for {symbol}.")
+
+    if not frame["volume"].map(math.isfinite).all() or (frame["volume"] < 0).any():
+        raise MarketDataError(f"Non-finite or negative volume found in candle data for {symbol}.")
 
     ohlc_cols = ["open", "high", "low", "close"]
     for col in ohlc_cols:
@@ -297,6 +363,10 @@ def validate_backtest_candles(
 
     if (frame["high"] < frame["low"]).any():
         raise MarketDataError(f"Invalid candle with high < low found for {symbol}.")
+    if (frame["high"] < frame[["open", "close"]].max(axis=1)).any():
+        raise MarketDataError(f"Invalid candle with high below open or close for {symbol}.")
+    if (frame["low"] > frame[["open", "close"]].min(axis=1)).any():
+        raise MarketDataError(f"Invalid candle with low above open or close for {symbol}.")
 
     # Check for missing candle gaps
     gaps = find_missing_candle_gaps(frame, timeframe_seconds * 1000)
@@ -586,11 +656,15 @@ def run_backtest(
             if running_peak_equity > 0
             else 0.0
         )
+        position_value_usd = max(0.0, current_equity - acc.cash_usd)
+        benchmark_price = current_close_prices.get(config.symbols[0], 0.0)
         equity_curve.append(
             {
                 "timestamp_utc": current_ts.isoformat(),
                 "cash_usd": acc.cash_usd,
                 "equity_usd": current_equity,
+                "position_value_usd": position_value_usd,
+                "benchmark_price": benchmark_price,
                 "peak_equity_usd": running_peak_equity,
                 "drawdown_pct": drawdown_pct,
             }
@@ -601,6 +675,10 @@ def run_backtest(
     assert final_account is not None
     final_positions = get_all_positions(db_conn, account_id)
     all_executions = list(reversed(get_paper_executions(db_conn, account_id=account_id, limit=10_000)))
+
+    # Net exit-tranche P&L includes sell-side costs from the execution record
+    # and a quantity-proportional allocation of pooled entry fees.
+    completed_trades, remaining_entry_fees = allocate_entry_fees_to_exits(all_executions)
 
     # Compute gross and net unrealized P&L on remaining holdings
     gross_unrealized_pnl = sum(
@@ -613,16 +691,8 @@ def run_backtest(
     total_return_pct = (total_net_profit_usd / config.initial_cash_usd) * 100.0
 
     # Separate entry fees on open positions vs closed trades
-    open_positions_fees_usd = sum(
-        float(pos.quantity * pos.average_entry_price * config.fee_rate)
-        for pos in final_positions
-        if pos.quantity > 0
-    )
-    total_buy_fees = sum(float(e["fee_usd"]) for e in all_executions if e["action"] == "BUY")
-    closed_entry_fees_usd = max(0.0, total_buy_fees - open_positions_fees_usd)
-
-    # Net realized P&L accounts for both entry and exit fees
-    net_realized_pnl = final_account.realized_pnl_usd - closed_entry_fees_usd
+    open_positions_fees_usd = sum(remaining_entry_fees.values())
+    net_realized_pnl = sum(float(t["net_realized_pnl_usd"]) for t in completed_trades)
     net_unrealized_pnl = gross_unrealized_pnl - open_positions_fees_usd
 
     # Buy-and-Hold Benchmark calculation
@@ -636,15 +706,7 @@ def run_backtest(
 
         s_execs = [e for e in all_executions if e["symbol"] == s]
         s_trades = [t for t in completed_trades if t["symbol"] == s]
-        s_buy_fees = sum(float(e["fee_usd"]) for e in s_execs if e["action"] == "BUY")
-        s_open_pos = next((p for p in final_positions if p.symbol == s and p.quantity > 0), None)
-        s_open_fee = (
-            float(s_open_pos.quantity * s_open_pos.average_entry_price * config.fee_rate)
-            if s_open_pos
-            else 0.0
-        )
-        s_closed_entry = max(0.0, s_buy_fees - s_open_fee)
-        s_realized = sum(t["realized_pnl_usd"] for t in s_trades) - s_closed_entry
+        s_realized = sum(float(t["net_realized_pnl_usd"]) for t in s_trades)
         s_fees = sum(float(e["fee_usd"]) for e in s_execs)
         symbol_breakdown[s] = {
             "executions_count": len(s_execs),
@@ -660,10 +722,10 @@ def run_backtest(
     max_drawdown_pct = max((pt["drawdown_pct"] for pt in equity_curve), default=0.0) * 100.0
 
     # Trade statistics
-    winning_trades = [t for t in completed_trades if t["realized_pnl_usd"] > 0]
-    losing_trades = [t for t in completed_trades if t["realized_pnl_usd"] < 0]
-    gross_profit_usd = sum(t["realized_pnl_usd"] for t in winning_trades)
-    gross_loss_usd = abs(sum(t["realized_pnl_usd"] for t in losing_trades))
+    winning_trades = [t for t in completed_trades if t["net_realized_pnl_usd"] > 0]
+    losing_trades = [t for t in completed_trades if t["net_realized_pnl_usd"] < 0]
+    gross_profit_usd = sum(t["net_realized_pnl_usd"] for t in winning_trades)
+    gross_loss_usd = abs(sum(t["net_realized_pnl_usd"] for t in losing_trades))
 
     if gross_loss_usd > 0:
         profit_factor = gross_profit_usd / gross_loss_usd
@@ -709,6 +771,7 @@ def run_backtest(
         equity_curve=equity_curve,
         symbol_breakdown=symbol_breakdown,
         execution_history=all_executions,
+        completed_trade_records=completed_trades,
     )
 
 
@@ -737,7 +800,7 @@ def format_backtest_report(report: BacktestReport) -> str:
         f"  Buy & Hold Benchmark:   {report.benchmark_return_pct:+.2f}% (100% asset buy-and-hold)",
         f"  Max Drawdown:           {report.max_drawdown_pct:.2f}% (from running peak equity)",
         f"  Total Executions:       {report.total_executions}",
-        f"  Completed Trades:       {report.completed_trades} (closed round-trips)",
+        f"  Realized Exit Tranches:  {report.completed_trades} (sell executions)",
         f"  Win Rate:               {report.win_rate_pct:.1f}% ({report.winning_trades} wins, {report.losing_trades} losses)",
         f"  Gross Profit:           ${report.gross_profit_usd:,.2f} USD",
         f"  Gross Loss:             ${report.gross_loss_usd:,.2f} USD",

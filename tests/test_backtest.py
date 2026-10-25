@@ -23,6 +23,7 @@ import pandas as pd
 import pytest
 
 from crypto_research.backtest import (
+    allocate_entry_fees_to_exits,
     BacktestConfig,
     BacktestReport,
     DeterministicRuleProvider,
@@ -155,6 +156,14 @@ def test_chronological_replay_executes_at_next_candle_open() -> None:
     assert sell_exec["raw_price"] == expected_sell_open_price
     # Fill price includes adverse slippage: open * (1 - 0.0005)
     assert sell_exec["execution_price"] == pytest.approx(expected_sell_open_price * 0.9995)
+    net_trade = report.completed_trade_records[0]
+    assert net_trade["allocated_entry_fee_usd"] == pytest.approx(buy_exec["fee_usd"])
+    assert net_trade["net_realized_pnl_usd"] == pytest.approx(
+        sell_exec["realized_pnl_usd"] - buy_exec["fee_usd"]
+    )
+    assert net_trade["realized_pnl_usd"] == pytest.approx(
+        net_trade["net_realized_pnl_usd"]
+    )
 
 
 def test_final_bar_signal_is_not_executed_without_next_candle() -> None:
@@ -377,6 +386,73 @@ def test_invalid_candle_data_fails_closed() -> None:
     bad_dup.loc[10, "timestamp"] = bad_dup.loc[9, "timestamp"]
     with pytest.raises(MarketDataError, match="Duplicate timestamp"):
         validate_backtest_candles(bad_dup, "BTC/USDT", 86_400)
+
+
+def test_invalid_candle_ohlc_volume_and_order_fail_closed() -> None:
+    candles = _linear_candles(250)
+
+    bad_high = candles.copy()
+    bad_high.loc[10, "high"] = bad_high.loc[10, "close"] - 0.25
+    with pytest.raises(MarketDataError, match="high below open or close"):
+        validate_backtest_candles(bad_high, "BTC/USDT", 86_400)
+
+    bad_low = candles.copy()
+    bad_low.loc[10, "low"] = bad_low.loc[10, "open"] + 0.25
+    with pytest.raises(MarketDataError, match="low above open or close"):
+        validate_backtest_candles(bad_low, "BTC/USDT", 86_400)
+
+    for bad_volume in (-1.0, float("inf")):
+        bad = candles.copy()
+        bad.loc[10, "volume"] = bad_volume
+        with pytest.raises(MarketDataError, match="volume"):
+            validate_backtest_candles(bad, "BTC/USDT", 86_400)
+
+    shuffled = candles.copy()
+    shuffled.loc[[10, 11], "timestamp"] = shuffled.loc[[11, 10], "timestamp"].to_numpy()
+    with pytest.raises(MarketDataError, match="Non-monotonic"):
+        validate_backtest_candles(shuffled, "BTC/USDT", 86_400)
+
+    gap = candles.drop(index=10).reset_index(drop=True)
+    with pytest.raises(MarketDataError, match="Missing candle gaps detected"):
+        validate_backtest_candles(gap, "BTC/USDT", 86_400)
+
+
+def test_entry_fees_are_allocated_across_partial_exits_and_open_inventory() -> None:
+    executions = [
+        {"symbol": "BTC/USDT", "action": "BUY", "quantity": 1.0, "fee_usd": 1.0},
+        {"symbol": "BTC/USDT", "action": "BUY", "quantity": 1.0, "fee_usd": 2.0},
+        {
+            "symbol": "BTC/USDT", "action": "SELL", "quantity": 0.5,
+            "fee_usd": 0.4, "realized_pnl_usd": 10.0,
+        },
+        {
+            "symbol": "BTC/USDT", "action": "SELL", "quantity": 1.0,
+            "fee_usd": 0.8, "realized_pnl_usd": 20.0,
+        },
+        {"symbol": "ETH/USDT", "action": "BUY", "quantity": 2.0, "fee_usd": 3.0},
+    ]
+
+    exits, remaining_fees = allocate_entry_fees_to_exits(executions)
+
+    # Average-cost, pro-rata allocation: the first 0.5 of 2 BTC allocates
+    # 0.75 fee; the next 1.0 of the remaining 1.5 allocates 1.50.
+    assert [row["allocated_entry_fee_usd"] for row in exits] == pytest.approx([0.75, 1.5])
+    assert [row["net_realized_pnl_usd"] for row in exits] == pytest.approx([9.25, 18.5])
+    assert [row["realized_pnl_usd"] for row in exits] == pytest.approx([9.25, 18.5])
+    assert remaining_fees["BTC/USDT"] == pytest.approx(0.75)
+    assert remaining_fees["ETH/USDT"] == pytest.approx(3.0)
+
+    # Full liquidation allocates all remaining entry fees; an open-only symbol
+    # retains its fee pool for net unrealized P&L.
+    executions.append({
+        "symbol": "BTC/USDT", "action": "SELL", "quantity": 0.5,
+        "fee_usd": 0.4, "realized_pnl_usd": 10.0,
+    })
+    exits, remaining_fees = allocate_entry_fees_to_exits(executions)
+    assert exits[-1]["allocated_entry_fee_usd"] == pytest.approx(0.75)
+    assert exits[-1]["net_realized_pnl_usd"] == pytest.approx(9.25)
+    assert remaining_fees["BTC/USDT"] == pytest.approx(0.0)
+    assert remaining_fees["ETH/USDT"] == pytest.approx(3.0)
 
 
 # =========================================================================
