@@ -56,25 +56,46 @@ crypto-research-agent/
 
 ## Setup
 
-Requires **Python 3.11+** (developed against 3.13). Public market data only — **do not put exchange API keys in `.env`.**
+Requires **Python 3.11+** (developed against 3.13), Git, and public internet access for exchange market data. No exchange API keys are required or supported. **Never put exchange credentials in `.env`.**
 
-```powershell
-cd C:\Users\force\crypto-research-agent
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
-copy .env.example .env
+Clone the repository on each computer:
+
+```sh
+git clone https://github.com/VincenElT/crypto-research-agent.git
+cd crypto-research-agent
 ```
 
-Edit `.env` if you want a different public symbol or exchange. Set `OPENAI_API_KEY` only if you want Scout/Skeptic to run. `OPENAI_MODEL` defaults to `gpt-4o-mini`.
+Create a virtual environment and install dependencies.
 
-## Running the live research pipeline
+**Windows PowerShell:**
+
+```powershell
+py -3 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+Copy-Item .env.example .env
+```
+
+**macOS / Linux:**
+
+```sh
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+cp .env.example .env
+```
+
+If Python 3.11 is not available as `py -3.11` or `python3`, install a supported Python version first. If PowerShell blocks environment activation, run the project commands with `.venv\Scripts\python.exe -m ...` without activating it.
+
+Edit `.env` to choose a public symbol or exchange. `OPENAI_API_KEY` is optional and only needed for Scout/Skeptic calls; the backtest and theory comparison use deterministic local rules. Each computer stores its own ignored SQLite files by default. Do not share `.env`, database files, or API keys through Git.
+
+## Running current-market research and paper trading
 
 ```powershell
 python -m crypto_research
 ```
 
-Fetches the latest closed candles, executes any pending paper trades from prior closed candles, runs Scout and Skeptic, evaluates deterministic risk filters, logs candidates to SQLite, and prints virtual portfolio status.
+This fetches current public market data, executes any pending **simulated paper** trades from prior closed candles, optionally runs Scout and Skeptic, applies deterministic risk filters, and records the virtual portfolio locally. The project does not place real exchange orders; this is suitable for a live-data paper test on another device. Without `OPENAI_API_KEY`, it prints the market summary and does not generate AI proposals.
 
 ## Running historical backtests
 
@@ -125,6 +146,46 @@ python -m crypto_research.backtest --csv-file path/to/candles.csv --symbols BTC/
 - **Profit Factor**: Gross profits divided by gross losses. Displays `inf (no losses)` if all trades are profitable.
 - **Execution History**: Chronological log of simulated fills with exact fees, slippage, and P&L.
 
+## Controlled strategy experiments
+
+`crypto_research.experiments.run_controlled_experiments` accepts explicitly named strategy hypotheses with a provider factory and JSON-serializable configuration. It evaluates each hypothesis on the development and validation splits only; it has no option to evaluate the final holdout. Runs are persisted to a separate SQLite research store with dataset/code/dependency fingerprints, configuration, parent experiment ID, period summaries, and a separate random run ID. Failed runs are saved before the original error is raised. Add a conclusion with `record_experiment_conclusion` after reviewing the evidence.
+
+```python
+from crypto_research.backtest import DeterministicRuleProvider
+from crypto_research.experiments import (
+    StrategyHypothesis,
+    run_controlled_experiments,
+)
+
+hypothesis = StrategyHypothesis(
+    name="baseline_control",
+    hypothesis="Current trend and momentum rules serve as the control.",
+    provider_name="DeterministicRuleProvider",
+    provider_factory=DeterministicRuleProvider,
+    configuration={"rule_set": "current_baseline"},
+)
+runs = run_controlled_experiments(
+    candles,
+    [hypothesis],
+    db_path="research/experiments.sqlite",
+    data_source="Verified public OHLCV CSV",
+)
+```
+
+This is an experiment harness, not evidence of a profitable edge. It includes a small fixed comparison set but does not generate strategies or optimize parameters automatically. Review both development and validation results, and keep the holdout untouched until strategy selection is frozen.
+
+### Run the included theory comparison
+
+With the virtual environment active, run:
+
+```sh
+python -m crypto_research.experiments --symbol BTC/USDT --timeframe 1d --candle-limit 1826
+```
+
+The CLI fetches public, closed daily candles and compares four fixed hypotheses: the existing baseline, 30-candle time-series momentum, a prior-nine-candle Donchian breakout, and a 2% below-SMA50 mean-reversion entry. It uses the same risk limits, fees, and slippage for each, reports development and validation results, and saves experiment history under `research/experiments.sqlite`. It does not evaluate the final holdout. Use only hypotheses chosen before reviewing results; do not repeatedly adjust thresholds to chase the best validation score.
+
+To use a local CSV instead, provide `--csv-file path/to/candles.csv`. It must contain valid, contiguous daily OHLCV candles, including at least 200 warm-up candles before 2022-06-01 and data through 2025-06-30. The included `data/btc_sample_1d.csv` is too short for the full development/validation experiment and will be rejected.
+
 ## Execution assumptions & limitations
 
 1. **Next-Candle Execution**: A trade proposal generated on candle $T_k$ fills strictly at the **open price** of candle $T_{k+1}$ ($T_{k+1} > T_k$).
@@ -144,7 +205,7 @@ python -m crypto_research.backtest --csv-file path/to/candles.csv --symbols BTC/
 python -m pytest -v
 ```
 
-All 85 tests run offline using synthetic fixtures with zero network dependencies or API costs.
+The test suite runs offline using synthetic fixtures; it makes no live exchange orders and does not require OpenAI calls.
 
 ## Safety notes
 

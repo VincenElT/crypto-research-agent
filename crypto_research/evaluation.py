@@ -561,6 +561,7 @@ def run_period_evaluation(
     fee_rate: float = 0.001,
     slippage_pct: float = 0.0005,
     risk_limits: RiskLimits | None = None,
+    decision_provider: Any | None = None,
 ) -> PeriodEvaluationResult:
     """Evaluate an inclusive daily candle-label range after each bar closes."""
     _require_daily_timeframe(timeframe)
@@ -583,7 +584,9 @@ def run_period_evaluation(
     report = run_backtest(
         config,
         candles_by_symbol={symbol: period_candles},
-        decision_provider=DeterministicRuleProvider(),
+        decision_provider=(
+            decision_provider if decision_provider is not None else DeterministicRuleProvider()
+        ),
     )
 
     # Compute extended quantitative metrics

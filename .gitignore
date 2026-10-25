@@ -9,5 +9,7 @@ __pycache__/
 dist/
 build/
 *.db
+*.sqlite
+*.sqlite3
 .coverage
 htmlcov/
