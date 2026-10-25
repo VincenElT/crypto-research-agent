@@ -43,6 +43,7 @@ from crypto_research.evaluation import (
     save_evaluation_artifacts,
 )
 from crypto_research.exceptions import (
+    BacktestError,
     ConfigurationError,
     InsufficientHistoryError,
     MarketDataError,
@@ -168,6 +169,16 @@ def test_btc_buy_and_hold_benchmark() -> None:
     assert bnh_b.avg_exposure_pct == 100.0
     assert bnh_b.pct_time_invested == 100.0
     assert bnh_b.sharpe_ratio > 0.0
+
+
+@pytest.mark.parametrize("invalid_price", [None, 0.0, -1.0, float("nan"), float("inf")])
+def test_benchmarks_fail_closed_on_missing_or_invalid_asset_prices(invalid_price: float | None) -> None:
+    curve = [
+        {"equity_usd": 10_000.0, "cash_usd": 10_000.0, "benchmark_price": 100.0},
+        {"equity_usd": 10_000.0, "cash_usd": 10_000.0, "benchmark_price": invalid_price},
+    ]
+    with pytest.raises(BacktestError, match="finite, positive benchmark prices"):
+        calculate_benchmarks(curve, initial_equity=10_000.0, strategy_avg_exposure_pct=0.0)
 
 
 def test_exposure_matched_benchmark() -> None:

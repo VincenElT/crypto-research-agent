@@ -459,11 +459,19 @@ def calculate_benchmarks(
         pct_time_invested=0.0,
     )
 
-    # Extract asset prices from equity curve
-    prices = [float(pt.get("benchmark_price", 0.0)) for pt in equity_curve]
-    # If benchmark_price was not recorded, fallback gracefully
-    if not any(p > 0 for p in prices):
-        prices = [1.0] * n_days
+    # Benchmark returns require the actual market prices recorded at each
+    # valuation. A flat synthetic fallback would make malformed input appear
+    # to be a valid zero-return benchmark.
+    try:
+        prices = [float(pt["benchmark_price"]) for pt in equity_curve]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise BacktestError(
+            "Evaluation benchmark requires finite, positive benchmark prices at every timestamp."
+        ) from exc
+    if any(not math.isfinite(price) or price <= 0.0 for price in prices):
+        raise BacktestError(
+            "Evaluation benchmark requires finite, positive benchmark prices at every timestamp."
+        )
 
     # 2. 100% BTC Buy-and-Hold Benchmark
     p0 = prices[0]
