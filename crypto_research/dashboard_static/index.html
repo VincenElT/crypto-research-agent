@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#10151d"><title>Signal Foundry · Research Console</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <a class="brand" href="#overview"><span class="brand-mark">SF</span><span><b>Signal Foundry</b><small>CRYPTO RESEARCH</small></span></a>
+      <div class="workspace-label">WORKSPACE</div>
+      <nav id="navigation">
+        <a class="active" href="#overview" data-page="overview"><i>◈</i> Mission Control</a>
+        <a href="#activity" data-page="activity"><i>≋</i> Agent Activity</a>
+        <a href="#reviews" data-page="reviews"><i>✳</i> Decision Review</a>
+        <a href="#market" data-page="market"><i>⌁</i> Market Explorer</a>
+        <a href="#models" data-page="models"><i>◉</i> Model Lab</a>
+        <a href="#journal" data-page="journal"><i>▤</i> Paper Journal</a>
+        <a href="#scorecards" data-page="scorecards"><i>◷</i> Agent Scorecards</a>
+      </nav>
+      <div class="sidebar-bottom"><span class="pulse"></span><span>Research mode</span><small>LIVE ORDERS OFF</small></div>
+    </aside>
+    <main class="main">
+      <header class="topbar"><div><div class="eyebrow">RESEARCH WORKSPACE <span>/</span> <b id="crumb">MISSION CONTROL</b></div><h1 id="page-title">Mission Control</h1></div><div class="top-actions"><span class="safe-badge"><i></i> PAPER ONLY</span><button class="icon-button" id="refresh" title="Refresh data">↻</button></div></header>
+      <div id="notice" role="status"></div>
+      <section id="page-content" aria-live="polite"><div class="loading">Loading research records…</div></section>
+      <footer><span>Signal Foundry <b>·</b> Local research console</span><span>Historical observations · Simulated trades · No exchange order access</span></footer>
+    </main>
+  </div>
+  <script src="/app.js" defer></script>
+</body>
+</html>

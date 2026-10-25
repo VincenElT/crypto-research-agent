@@ -13,3 +13,5 @@ build/
 *.sqlite3
 .coverage
 htmlcov/
+/artifacts/
+/research/

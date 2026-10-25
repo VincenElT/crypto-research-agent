@@ -23,6 +23,9 @@ crypto-research-agent/
     paper_trading.py    # persistent virtual portfolio and execution
     storage.py          # SQLite decision-log and audit trail
     backtest.py         # historical backtesting engine & CLI
+    ml_pipeline.py      # reproducible hourly ML training and walk-forward evaluation
+    dashboard.py        # local research dashboard and safe API
+    dashboard_static/   # responsive browser UI (no frontend build required)
   tests/
   .env.example
   requirements.txt
@@ -36,6 +39,7 @@ crypto-research-agent/
 | 2. Dual agents | **Implemented** | Scout + Skeptic via OpenAI, strict JSON schema validation |
 | 3. Risk + paper trade | **Implemented** | Deterministic risk filters, persistent virtual portfolio, SQLite logs |
 | 4. Backtest | **Implemented** | Chronological replay, next-candle execution, fees/slippage, performance metrics vs buy-and-hold |
+| 5. Model research + dashboard | **Implemented** | Hourly BTC/ETH model comparisons, persistent review labels, and local interactive research console |
 
 ## Implemented in this version
 
@@ -87,7 +91,43 @@ cp .env.example .env
 
 If Python 3.11 is not available as `py -3.11` or `python3`, install a supported Python version first. If PowerShell blocks environment activation, run the project commands with `.venv\Scripts\python.exe -m ...` without activating it.
 
-Edit `.env` to choose a public symbol or exchange. `OPENAI_API_KEY` is optional and only needed for Scout/Skeptic calls; the backtest and theory comparison use deterministic local rules. Each computer stores its own ignored SQLite files by default. Do not share `.env`, database files, or API keys through Git.
+Edit `.env` to choose a public symbol or exchange. `OPENAI_API_KEY` is optional and only needed for Scout/Skeptic calls; the backtest and theory comparison use deterministic local rules. Each computer stores its own ignored SQLite files and research artifacts by default. Do not share `.env`, database files, model files, or API keys through Git. These setup steps are intended to be repeated independently on every Windows, macOS, or Linux computer; do not copy the `.venv` folder between machines.
+
+## Start the interactive research dashboard
+
+Start it after installing the project dependencies:
+
+```powershell
+python -m crypto_research.dashboard
+```
+
+Then open <http://127.0.0.1:8765>. The dashboard reads the same local SQLite paper account and logs used by the CLI. It includes Mission Control, Agent Activity, Decision Review with append-only labels and CSV export, Market Explorer, Model Lab, Paper Journal, and Agent Scorecards. Missing records are shown as not available rather than being filled with demo numbers. All generated trades are simulated; no exchange-order endpoint exists.
+
+To use the project on a friend's computer, clone the repository there and repeat the setup above. The local dashboard intentionally listens only on that computer by default; it does not expose an unauthenticated dashboard over a shared network. SQLite history and locally saved models are not synchronized between devices. If you want to show your existing data, use the dashboard's reviewed-label CSV export or prepare a separate sanitized export; never send `.env` or credentials.
+
+Decision labels are human annotations, separate from market outcomes and model targets. Changing a label adds a revision. The CSV export documents this distinction so annotations are not silently treated as supervised truth.
+
+## Train and evaluate hourly predictors
+
+The Model Lab can start a fixed training job, or use the CLI:
+
+```powershell
+python -m crypto_research.ml_pipeline --symbols BTC/USDT ETH/USDT --candle-limit 10000
+```
+
+This fetches public closed 1-hour OHLCV candles and compares scaled logistic regression with histogram gradient boosting. Features use information in a fully closed candle. The target is whether the close four hourly bars later is above the current close (flat is labeled down); that is a direction classification task, not a claim that returns cover costs. Training uses ordered expanding walk-forward folds and 60/20/20 train, validation, and reserved out-of-sample blocks with a four-bar purge at split boundaries. Do not tune using the reserved out-of-sample period.
+
+The Model Lab reports Brier score, log loss, precision/recall and calibration, alongside a separate next-open paper strategy simulation with modeled fees/slippage, cash-only, buy-and-hold, and existing fixed-rule controls. Model binaries, exact fetched datasets, metadata, predictions, and logs are written under the ignored `artifacts/` directory and local SQLite database; they are not committed to Git. Training needs public internet but no exchange credentials.
+
+## Compare fixed strategy theories
+
+The existing experiment harness compares the current rule control with fixed time-series momentum, prior-nine-candle Donchian breakout, and SMA50 mean-reversion hypotheses on development and validation periods only:
+
+```powershell
+python -m crypto_research.experiments --symbol BTC/USDT --timeframe 1d --candle-limit 1826
+```
+
+The thresholds are predeclared and not optimized. Compare them using identical evaluation periods, fees, slippage, and risk limits; the final holdout is not used by this command. Experiment history is local and ignored by Git. This is research tooling, not evidence that a strategy has an edge.
 
 ## Running current-market research and paper trading
 

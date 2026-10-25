@@ -64,6 +64,8 @@ CREATE TABLE IF NOT EXISTS agent_decisions (
     skeptic_rationale TEXT NOT NULL,
     skeptic_weaknesses_json TEXT NOT NULL,
     skeptic_missing_evidence_json TEXT NOT NULL,
+    model_version TEXT,
+    prediction_horizon TEXT,
     created_at_utc TEXT NOT NULL
 );
 
@@ -165,6 +167,70 @@ CREATE TABLE IF NOT EXISTS portfolio_snapshots (
     drawdown_pct REAL NOT NULL,
     created_at_utc TEXT NOT NULL
 );
+
+-- Append-only decision reviews preserve revisions instead of overwriting labels.
+CREATE TABLE IF NOT EXISTS decision_reviews (
+    review_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    decision_id INTEGER NOT NULL REFERENCES agent_decisions(id),
+    label TEXT NOT NULL CHECK (label IN (
+        'good_decision', 'bad_decision', 'uncertain', 'needs_review',
+        'good_reasoning_bad_outcome', 'bad_reasoning_good_outcome'
+    )),
+    comment TEXT NOT NULL DEFAULT '',
+    reviewer TEXT NOT NULL DEFAULT 'local_user',
+    reviewed_at_utc TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_decision_reviews_latest
+    ON decision_reviews(decision_id, review_id DESC);
+
+CREATE TABLE IF NOT EXISTS model_runs (
+    model_version TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL UNIQUE,
+    model_name TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    timeframe TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed')),
+    dataset_sha256 TEXT NOT NULL,
+    data_start_utc TEXT NOT NULL,
+    data_end_utc TEXT NOT NULL,
+    artifact_path TEXT,
+    metadata_json TEXT NOT NULL,
+    metrics_json TEXT NOT NULL DEFAULT '{}',
+    error_message TEXT,
+    created_at_utc TEXT NOT NULL,
+    completed_at_utc TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_model_runs_created ON model_runs(created_at_utc DESC);
+
+CREATE TABLE IF NOT EXISTS model_predictions (
+    prediction_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    model_version TEXT NOT NULL REFERENCES model_runs(model_version),
+    split_name TEXT NOT NULL CHECK (split_name IN ('validation', 'out_of_sample')),
+    as_of_utc TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    probability_up REAL NOT NULL CHECK (probability_up >= 0 AND probability_up <= 1),
+    predicted_direction INTEGER NOT NULL CHECK (predicted_direction IN (0, 1)),
+    observed_direction INTEGER NOT NULL CHECK (observed_direction IN (0, 1)),
+    forward_return REAL NOT NULL,
+    created_at_utc TEXT NOT NULL,
+    UNIQUE(model_version, split_name, as_of_utc)
+);
+CREATE INDEX IF NOT EXISTS idx_model_predictions_time
+    ON model_predictions(symbol, as_of_utc DESC);
+
+CREATE TABLE IF NOT EXISTS training_jobs (
+    job_id TEXT PRIMARY KEY,
+    status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'completed', 'failed')),
+    symbols_json TEXT NOT NULL,
+    timeframe TEXT NOT NULL,
+    candle_limit INTEGER NOT NULL,
+    progress_json TEXT NOT NULL DEFAULT '{}',
+    error_message TEXT,
+    created_at_utc TEXT NOT NULL,
+    updated_at_utc TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_training_jobs_single_active
+    ON training_jobs((1)) WHERE status IN ('queued', 'running');
 """
 
 FORBIDDEN_KEY_FRAGMENTS = ("key", "secret", "password", "token", "auth", "credential")
@@ -204,8 +270,16 @@ def init_db(db_target: str | Path | sqlite3.Connection) -> sqlite3.Connection:
                 path.parent.mkdir(parents=True, exist_ok=True)
             conn = sqlite3.connect(str(path))
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
         with conn:
             conn.executescript(SCHEMA_SQL)
+            decision_columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(agent_decisions)").fetchall()
+            }
+            if "model_version" not in decision_columns:
+                conn.execute("ALTER TABLE agent_decisions ADD COLUMN model_version TEXT")
+            if "prediction_horizon" not in decision_columns:
+                conn.execute("ALTER TABLE agent_decisions ADD COLUMN prediction_horizon TEXT")
         return conn
     except sqlite3.Error as exc:
         raise StorageError(f"Failed to initialize SQLite database: {exc}") from exc
@@ -250,6 +324,9 @@ def log_agent_decision(
     symbol: str,
     as_of_utc: str,
     result: DualAgentResult,
+    *,
+    model_version: str | None = None,
+    prediction_horizon: str | None = None,
 ) -> int:
     """Record validated Scout proposal and Skeptic review."""
     now_utc = datetime.now(timezone.utc).isoformat()
@@ -264,8 +341,9 @@ def log_agent_decision(
                     scout_thesis, scout_evidence_json, scout_risks_json,
                     scout_missing_data_json, skeptic_verdict, skeptic_agrees,
                     skeptic_confidence, skeptic_rationale, skeptic_weaknesses_json,
-                    skeptic_missing_evidence_json, created_at_utc
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    skeptic_missing_evidence_json, model_version, prediction_horizon,
+                    created_at_utc
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     as_of_utc,
@@ -282,12 +360,77 @@ def log_agent_decision(
                     c.rationale,
                     json.dumps(c.weaknesses),
                     json.dumps(c.missing_evidence),
+                    model_version,
+                    prediction_horizon,
                     now_utc,
                 ),
             )
             return int(cursor.lastrowid)
     except sqlite3.Error as exc:
         raise StorageError(f"Failed to log agent decision: {exc}") from exc
+
+
+DECISION_REVIEW_LABELS = frozenset(
+    {
+        "good_decision",
+        "bad_decision",
+        "uncertain",
+        "needs_review",
+        "good_reasoning_bad_outcome",
+        "bad_reasoning_good_outcome",
+    }
+)
+
+
+def save_decision_review(
+    conn: sqlite3.Connection,
+    decision_id: int,
+    label: str,
+    comment: str = "",
+    reviewer: str = "local_user",
+) -> int:
+    """Append a decision annotation; a later correction is a new revision."""
+    if label not in DECISION_REVIEW_LABELS:
+        raise StorageError(f"Unsupported decision review label: {label!r}")
+    if len(comment) > 2_000:
+        raise StorageError("Decision review comment cannot exceed 2000 characters.")
+    if not reviewer.strip() or len(reviewer) > 100:
+        raise StorageError("Decision review identity must be 1-100 characters.")
+    try:
+        with conn:
+            cursor = conn.execute(
+                """INSERT INTO decision_reviews (
+                       decision_id, label, comment, reviewer, reviewed_at_utc
+                   ) VALUES (?, ?, ?, ?, ?)""",
+                (
+                    decision_id,
+                    label,
+                    comment.strip(),
+                    reviewer.strip(),
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            return int(cursor.lastrowid)
+    except sqlite3.IntegrityError as exc:
+        raise StorageError(f"Cannot annotate unknown decision {decision_id}: {exc}") from exc
+    except sqlite3.Error as exc:
+        raise StorageError(f"Failed to save decision review: {exc}") from exc
+
+
+def get_decision_review_history(
+    conn: sqlite3.Connection,
+    decision_id: int,
+) -> list[dict[str, Any]]:
+    """Return all annotation revisions, oldest first."""
+    try:
+        rows = conn.execute(
+            """SELECT review_id, decision_id, label, comment, reviewer, reviewed_at_utc
+               FROM decision_reviews WHERE decision_id = ? ORDER BY review_id ASC""",
+            (decision_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+    except sqlite3.Error as exc:
+        raise StorageError(f"Failed to read decision review history: {exc}") from exc
 
 
 def log_risk_evaluation(

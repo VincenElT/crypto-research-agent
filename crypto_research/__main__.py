@@ -137,7 +137,14 @@ def main() -> int:
         result = run_dual_agents(context, model_name=settings.openai_model)
         print()
         print(format_dual_agent_result(result))
-        log_agent_decision(conn, settings.symbol, snapshot.as_of.isoformat(), result)
+        log_agent_decision(
+            conn,
+            settings.symbol,
+            snapshot.as_of.isoformat(),
+            result,
+            model_version=settings.openai_model,
+            prediction_horizon="not specified by current Scout schema",
+        )
 
         # Reconstruct portfolio state from SQLite history
         portfolio = load_portfolio_state_from_db(
