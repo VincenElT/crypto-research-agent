@@ -323,6 +323,69 @@ def test_multi_symbol_backtest_with_breakdown() -> None:
     assert isinstance(report.symbol_breakdown["ETH/USDT"]["benchmark_return_pct"], float)
 
 
+def test_multi_symbol_uses_shared_timestamp_range_for_valuation() -> None:
+    # Different history end dates are allowed: valuation and benchmarks use
+    # the synchronized overlap, never the later symbol's stale entry price.
+    candles_btc = _linear_candles(252, start_price=50_000.0, step=100.0)
+    candles_eth = _linear_candles(250, start_price=3_000.0, step=10.0)
+    signal_ts = candles_eth.iloc[200]["timestamp"].isoformat()
+    buy_eth = DualAgentResult(
+        proposal=ScoutProposal(
+            action="BUY", confidence=0.9, thesis="test buy", evidence=["test"],
+            risks=["fixture"], missing_data=[],
+        ),
+        critique=SkepticReview(
+            verdict="APPROVE", agrees_with_action=True, rationale="test",
+            missing_evidence=[], weaknesses=["fixture"], confidence=0.9,
+        ),
+    )
+    report = run_backtest(
+        BacktestConfig(
+            run_id="test_multi_shared_overlap",
+            symbols=["BTC/USDT", "ETH/USDT"],
+            initial_cash_usd=20_000.0,
+        ),
+        candles_by_symbol={"BTC/USDT": candles_btc, "ETH/USDT": candles_eth},
+        decision_provider=RecordedDecisionProvider({("ETH/USDT", signal_ts): buy_eth}),
+    )
+
+    assert len(report.equity_curve) == 51  # Shared eligible timestamps: bars 199..249.
+    assert report.equity_curve[0]["timestamp_utc"] == candles_eth.iloc[199]["timestamp"].isoformat()
+    assert report.equity_curve[-1]["timestamp_utc"] == candles_eth.iloc[249]["timestamp"].isoformat()
+    assert all(set(point["prices_usd"]) == {"BTC/USDT", "ETH/USDT"} for point in report.equity_curve)
+
+    fill_mark = next(
+        point for point in report.equity_curve
+        if point["timestamp_utc"] == candles_eth.iloc[201]["timestamp"].isoformat()
+    )
+    eth_buy = next(e for e in report.execution_history if e["symbol"] == "ETH/USDT")
+    assert fill_mark["prices_usd"]["ETH/USDT"] == candles_eth.iloc[201]["close"]
+    assert eth_buy["action"] == "BUY"
+    assert fill_mark["position_value_usd"] > 0.0
+    expected_eth_return = (
+        (candles_eth.iloc[249]["close"] / candles_eth.iloc[199]["close"]) - 1.0
+    ) * 100.0
+    assert report.symbol_breakdown["ETH/USDT"]["benchmark_return_pct"] == pytest.approx(
+        expected_eth_return
+    )
+
+
+def test_multi_symbol_rejects_offset_candle_timestamps() -> None:
+    candles_btc = _linear_candles(250, start_price=50_000.0)
+    candles_eth = _linear_candles(250, start_price=3_000.0)
+    candles_eth["timestamp"] += pd.Timedelta(hours=12)
+    config = BacktestConfig(
+        run_id="test_multi_offset_timestamps",
+        symbols=["BTC/USDT", "ETH/USDT"],
+    )
+    with pytest.raises(BacktestError, match="synchronized eligible candle timestamps"):
+        run_backtest(
+            config,
+            candles_by_symbol={"BTC/USDT": candles_btc, "ETH/USDT": candles_eth},
+            decision_provider=RecordedDecisionProvider({}),
+        )
+
+
 def test_backtest_run_does_not_contaminate_normal_paper_portfolio() -> None:
     conn = init_db(":memory:")
     # Initialize normal paper portfolio

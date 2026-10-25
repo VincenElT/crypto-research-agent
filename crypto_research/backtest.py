@@ -379,6 +379,61 @@ def validate_backtest_candles(
     return frame
 
 
+def build_aligned_timeline(
+    timestamps_by_symbol: dict[str, list[pd.Timestamp]],
+) -> list[pd.Timestamp]:
+    """Return shared timestamps, rejecting unsynchronized bars in the overlap.
+
+    Symbols may have different history start/end dates. The simulation uses
+    their common time range and requires every symbol to have an eligible bar
+    at each timestamp in that range. This prevents stale-price marking and
+    unequal-time-step portfolio valuations.
+    """
+    if not timestamps_by_symbol:
+        raise BacktestError("Cannot align an empty symbol timestamp collection.")
+    for symbol, timestamps in timestamps_by_symbol.items():
+        if not timestamps:
+            raise InsufficientHistoryError(
+                f"No indicator-eligible timestamps are available for {symbol}."
+            )
+
+    overlap_start = max(timestamps[0] for timestamps in timestamps_by_symbol.values())
+    overlap_end = min(timestamps[-1] for timestamps in timestamps_by_symbol.values())
+    if overlap_start > overlap_end:
+        raise BacktestError(
+            "Multi-symbol backtest has no shared timestamp range after indicator warm-up."
+        )
+
+    first_symbol = next(iter(timestamps_by_symbol))
+    timeline = [
+        timestamp
+        for timestamp in timestamps_by_symbol[first_symbol]
+        if overlap_start <= timestamp <= overlap_end
+    ]
+    if not timeline:
+        raise BacktestError(
+            "Multi-symbol backtest has no synchronized timestamps in the shared range."
+        )
+
+    for symbol, timestamps in timestamps_by_symbol.items():
+        if symbol == first_symbol:
+            continue
+        observed = [t for t in timestamps if overlap_start <= t <= overlap_end]
+        if observed != timeline:
+            expected_set = set(timeline)
+            observed_set = set(observed)
+            first_mismatch = next(
+                (t for t in timeline if t not in observed_set),
+                next((t for t in observed if t not in expected_set), overlap_start),
+            )
+            raise BacktestError(
+                "Multi-symbol backtest requires synchronized eligible candle "
+                f"timestamps in the shared range; {symbol} is missing or offset "
+                f"at {first_mismatch.isoformat()}. Align the candle datasets before running."
+            )
+    return timeline
+
+
 def run_backtest(
     config: BacktestConfig,
     *,
@@ -437,7 +492,7 @@ def run_backtest(
         prepared_candles[symbol] = with_ind
 
     # Determine simulation timeline across all symbols
-    all_timestamps: set[pd.Timestamp] = set()
+    timestamps_by_symbol: dict[str, list[pd.Timestamp]] = {}
     for symbol, df in prepared_candles.items():
         # Only bars where indicators are fully defined are eligible decision points
         valid_bars = df[
@@ -449,9 +504,9 @@ def run_backtest(
             raise InsufficientHistoryError(
                 f"Insufficient candle history to calculate SMA200 and momentum for {symbol}."
             )
-        all_timestamps.update(valid_bars["timestamp"].tolist())
+        timestamps_by_symbol[symbol] = valid_bars["timestamp"].tolist()
 
-    timeline = sorted(list(all_timestamps))
+    timeline = build_aligned_timeline(timestamps_by_symbol)
 
     if config.start_date:
         start_ts = pd.Timestamp(config.start_date)
@@ -556,7 +611,10 @@ def run_backtest(
             df = prepared_candles[symbol]
             aligned_candles = df[df["timestamp"] <= current_ts]
             if aligned_candles.empty or aligned_candles.iloc[-1]["timestamp"] != current_ts:
-                continue
+                raise BacktestError(
+                    f"Aligned timeline is missing a closed candle for {symbol} "
+                    f"at {current_ts.isoformat()}. Refusing stale-price valuation."
+                )
 
             # Record benchmark prices
             close_price = float(aligned_candles.iloc[-1]["close"])
@@ -665,6 +723,7 @@ def run_backtest(
                 "equity_usd": current_equity,
                 "position_value_usd": position_value_usd,
                 "benchmark_price": benchmark_price,
+                "prices_usd": current_close_prices.copy(),
                 "peak_equity_usd": running_peak_equity,
                 "drawdown_pct": drawdown_pct,
             }
