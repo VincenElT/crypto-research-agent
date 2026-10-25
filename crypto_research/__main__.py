@@ -45,6 +45,12 @@ from crypto_research.summary import (
 def main() -> int:
     """Fetch closed candles, execute pending orders, run agents, evaluate risk, and log audit trail."""
 
+    if "--backtest" in sys.argv:
+        from crypto_research.backtest import main as backtest_main
+
+        sys.argv.remove("--backtest")
+        return backtest_main()
+
     conn: sqlite3.Connection | None = None
     snapshot: IndicatorSnapshot | None = None
 

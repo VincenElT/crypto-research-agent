@@ -31,3 +31,7 @@ class PaperTradingError(CryptoResearchError):
 
 class StorageError(CryptoResearchError):
     """Raised when SQLite storage operations fail."""
+
+
+class BacktestError(CryptoResearchError):
+    """Raised when historical backtesting simulation encounters invalid inputs or states."""
