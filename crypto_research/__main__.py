@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 import sys
+import time
 from datetime import datetime, timezone
 
 from crypto_research.config import load_settings
@@ -42,8 +43,52 @@ from crypto_research.summary import (
 )
 
 
+def seconds_until_next_candle(now_epoch: float, timeframe_seconds: int, *, safety_delay: int = 2) -> float:
+    """Return a positive wait to just after the next UTC candle boundary."""
+    if timeframe_seconds <= 0 or safety_delay < 0:
+        raise ValueError("Timeframe must be positive and safety delay cannot be negative.")
+    next_boundary = (int(now_epoch // timeframe_seconds) + 1) * timeframe_seconds
+    return max(0.0, next_boundary + safety_delay - now_epoch)
+
+
 def main() -> int:
-    """Fetch closed candles, execute pending orders, run agents, evaluate risk, and log audit trail."""
+    """Run once, or poll each configured candle close with ``--watch``."""
+    if "--watch" not in sys.argv:
+        return _run_once()
+    if "--backtest" in sys.argv:
+        print("--watch cannot be combined with --backtest.", file=sys.stderr)
+        return 2
+    sys.argv.remove("--watch")
+    try:
+        settings = load_settings()
+        exchange = create_public_exchange(settings.exchange_id)
+        timeframe_seconds = int(exchange.parse_timeframe(settings.timeframe))
+        if timeframe_seconds <= 0:
+            raise ValueError(f"Unsupported watch timeframe: {settings.timeframe}")
+        print(
+            f"Paper watch started for {settings.symbol} ({settings.timeframe}); "
+            "live exchange orders are disabled. Press Ctrl+C to stop."
+        )
+        while True:
+            result = _run_once()
+            if result != 0:
+                print("Paper watch stopped after a failed research cycle.", file=sys.stderr)
+                return result
+            now_epoch = time.time()
+            delay = seconds_until_next_candle(now_epoch, timeframe_seconds)
+            next_run = datetime.fromtimestamp(now_epoch + delay, timezone.utc)
+            print(f"Next closed-candle research cycle after {next_run.isoformat()} UTC.")
+            time.sleep(delay)
+    except KeyboardInterrupt:
+        print("\nPaper watch stopped. No live exchange orders were sent.")
+        return 0
+    except (CryptoResearchError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+
+def _run_once() -> int:
+    """Fetch closed candles, execute simulated fills, run agents, and log the audit trail."""
 
     if "--backtest" in sys.argv:
         from crypto_research.backtest import main as backtest_main

@@ -137,6 +137,14 @@ python -m crypto_research
 
 This fetches current public market data, executes any pending **simulated paper** trades from prior closed candles, optionally runs Scout and Skeptic, applies deterministic risk filters, and records the virtual portfolio locally. The project does not place real exchange orders; this is suitable for a live-data paper test on another device. Without `OPENAI_API_KEY`, it prints the market summary and does not generate AI proposals.
 
+For repeated paper updates, set `TIMEFRAME=1h` in your local `.env` and run:
+
+```powershell
+python -m crypto_research --watch
+```
+
+Watch mode runs one research cycle immediately, then waits until just after each configured candle boundary before checking the next closed candle. It stops on a failed data/research cycle and can be stopped with Ctrl+C. It only creates virtual paper trades; the account is isolated from exchange balances and no exchange order API is called. With `OPENAI_API_KEY` configured, each cycle also calls Scout and Skeptic, which may incur API usage costs.
+
 ## Running historical backtests
 
 The backtester can be run directly from the command line without modifying any source code.
