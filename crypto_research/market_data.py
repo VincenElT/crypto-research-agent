@@ -1,4 +1,4 @@
-"""Fetch historical OHLCV candles from a public CCXT market-data API.
+"""Fetch historical OHLCV candles from a public CCXT market-data API or Binance Vision.
 
 This module never authenticates to an exchange and never places orders.
 Decisions later in the pipeline must use only closed candles so incomplete
@@ -8,7 +8,13 @@ bars cannot leak future information (look-ahead bias).
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
+import math
+import ssl
+import time
 from typing import Any
+import urllib.error
+import urllib.request
 
 import ccxt
 import numpy as np
@@ -27,6 +33,192 @@ OHLCV_COLUMNS = ("timestamp", "open", "high", "low", "close", "volume")
 MAX_FETCH_ATTEMPTS = 4
 
 
+class BinanceVisionClient:
+    """Isolated public market data adapter for Binance Vision endpoints.
+
+    Uses Python's standard urllib HTTPS client with TLS certificate verification
+    strictly enabled. Never authenticates, never places orders, and queries only
+    public market data at https://data-api.binance.vision/api/v3.
+    """
+
+    BASE_URL: str = "https://data-api.binance.vision/api/v3"
+    timeframes: dict[str, str] = {
+        "1m": "1m",
+        "3m": "3m",
+        "5m": "5m",
+        "15m": "15m",
+        "30m": "30m",
+        "1h": "1h",
+        "2h": "2h",
+        "4h": "4h",
+        "6h": "6h",
+        "8h": "8h",
+        "12h": "12h",
+        "1d": "1d",
+        "3d": "3d",
+        "1w": "1w",
+        "1M": "1M",
+    }
+    rateLimit: int = 100
+
+    def __init__(self, base_url: str | None = None, timeout_seconds: float = 15.0) -> None:
+        self.base_url = (base_url or self.BASE_URL).rstrip("/")
+        self.timeout_seconds = timeout_seconds
+
+    def parse_timeframe(self, timeframe: str) -> int:
+        """Parse timeframe string into seconds."""
+        units = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800, "M": 2592000}
+        num_str = timeframe[:-1]
+        unit = timeframe[-1]
+        if not num_str.isdigit() or unit not in units:
+            raise ConfigurationError(f"Unsupported or invalid timeframe format: {timeframe!r}")
+        return int(num_str) * units[unit]
+
+    def sleep(self, milliseconds: int) -> None:
+        time.sleep(milliseconds / 1000.0)
+
+    @staticmethod
+    def normalize_symbol(symbol: str) -> str:
+        """Convert 'BTC/USDT' or 'BTC-USDT' to Binance market format 'BTCUSDT'."""
+        return symbol.replace("/", "").replace("-", "").replace("_", "").upper()
+
+    def fetch_ohlcv(
+        self,
+        symbol: str,
+        timeframe: str = "1d",
+        since: int | None = None,
+        limit: int = 500,
+        params: dict[str, Any] | None = None,
+    ) -> list[list[Any]]:
+        """Fetch historical OHLCV candles with backward pagination and TLS verification."""
+        if timeframe not in self.timeframes:
+            supported = ", ".join(sorted(self.timeframes))
+            raise ConfigurationError(
+                f"Timeframe {timeframe!r} is not supported by Binance Vision. Supported: {supported}."
+            )
+
+        norm_sym = self.normalize_symbol(symbol)
+        ctx = ssl.create_default_context()
+        all_bars: list[list[Any]] = []
+        # Request limit + 1 so that after drop_incomplete_candle drops the in-progress bar,
+        # exactly limit closed candles remain.
+        target_count = max(1, limit + 1)
+        remaining = target_count
+        end_time: int | None = None
+
+        while remaining > 0:
+            fetch_count = min(1000, remaining)
+            url = (
+                f"{self.base_url}/klines?"
+                f"symbol={norm_sym}&interval={timeframe}&limit={fetch_count}"
+            )
+            if end_time is not None:
+                url += f"&endTime={end_time}"
+            if since is not None and end_time is None:
+                url += f"&startTime={since}"
+
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "crypto-research-agent/1.0"},
+            )
+
+            try:
+                with urllib.request.urlopen(req, context=ctx, timeout=self.timeout_seconds) as resp:
+                    raw_data = resp.read().decode("utf-8")
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")
+                detail = f"HTTP {exc.code} {exc.reason}"
+                try:
+                    err_json = json.loads(body)
+                    if isinstance(err_json, dict) and "msg" in err_json:
+                        detail = f"{detail}: {err_json['msg']}"
+                except Exception:
+                    pass
+                raise MarketDataError(
+                    f"Binance Vision API HTTP error fetching {symbol}: {detail}"
+                ) from exc
+            except urllib.error.URLError as exc:
+                detail = str(exc.reason)
+                if "certificate" in detail.lower() or "ssl" in detail.lower():
+                    raise MarketDataError(
+                        f"TLS verification failed while fetching {symbol} from Binance Vision: {detail}"
+                    ) from exc
+                raise MarketDataError(
+                    f"Network connection failed while fetching {symbol} from Binance Vision: {detail}"
+                ) from exc
+            except TimeoutError as exc:
+                raise MarketDataError(
+                    f"Network timeout ({self.timeout_seconds}s) while fetching {symbol} from Binance Vision."
+                ) from exc
+
+            try:
+                data = json.loads(raw_data)
+            except json.JSONDecodeError as exc:
+                raise MarketDataError(
+                    f"Malformed JSON response from Binance Vision for {symbol}: {exc}"
+                ) from exc
+
+            if not isinstance(data, list):
+                raise MarketDataError(
+                    f"Unexpected response structure from Binance Vision for {symbol}: expected list of candles."
+                )
+
+            if not data:
+                break
+
+            parsed_chunk: list[list[Any]] = []
+            for item in data:
+                if not isinstance(item, (list, tuple)) or len(item) < 6:
+                    raise MarketDataError(
+                        f"Malformed candle row from Binance Vision for {symbol}: {item}"
+                    )
+                try:
+                    t_ms = int(item[0])
+                    o = float(item[1])
+                    h = float(item[2])
+                    l = float(item[3])
+                    c = float(item[4])
+                    v = float(item[5])
+                except (ValueError, TypeError) as exc:
+                    raise MarketDataError(
+                        f"Non-numeric values in candle from Binance Vision for {symbol}: {exc}"
+                    ) from exc
+                parsed_chunk.append([t_ms, o, h, l, c, v])
+
+            all_bars = parsed_chunk + all_bars
+            remaining -= len(parsed_chunk)
+            earliest_open = parsed_chunk[0][0]
+            end_time = earliest_open - 1
+
+            if len(parsed_chunk) < fetch_count:
+                break
+
+        seen_ts: set[int] = set()
+        deduped: list[list[Any]] = []
+        for bar in all_bars:
+            if bar[0] not in seen_ts:
+                seen_ts.add(bar[0])
+                deduped.append(bar)
+
+        deduped.sort(key=lambda x: x[0])
+        return deduped[-target_count:]
+
+
+def create_ccxt_binance_exchange() -> ccxt.binance:
+    """Create a CCXT Binance exchange configured to use data-api.binance.vision."""
+    return ccxt.binance(
+        {
+            "enableRateLimit": True,
+            "options": {"fetchMarkets": ["spot"]},
+            "urls": {
+                "api": {
+                    "public": "https://data-api.binance.vision/api/v3",
+                }
+            },
+        }
+    )
+
+
 def _exception_chain_text(exc: BaseException) -> str:
     """Flatten CCXT/requests exception causes so TLS failures are visible."""
 
@@ -40,8 +232,15 @@ def _exception_chain_text(exc: BaseException) -> str:
     return " | ".join(parts)
 
 
-def create_public_exchange(exchange_id: str) -> ccxt.Exchange:
-    """Instantiate a CCXT exchange client for public market data only."""
+def create_public_exchange(exchange_id: str) -> ccxt.Exchange | BinanceVisionClient:
+    """Instantiate a public market data client.
+
+    For 'binance', returns BinanceVisionClient using the verified public
+    data-api.binance.vision endpoint with strict TLS verification and pagination.
+    For other supported exchanges, instantiates CCXT for public market data.
+    """
+    if exchange_id.lower() == "binance":
+        return BinanceVisionClient()
 
     try:
         exchange_class = getattr(ccxt, exchange_id)
@@ -106,12 +305,15 @@ def find_missing_candle_gaps(frame: pd.DataFrame, timeframe_ms: int) -> list[str
     return gaps
 
 
-def fetch_ohlcv(settings: Settings, exchange: ccxt.Exchange | None = None) -> pd.DataFrame:
+def fetch_ohlcv(
+    settings: Settings,
+    exchange: ccxt.Exchange | BinanceVisionClient | None = None,
+) -> pd.DataFrame:
     """Fetch closed historical candles for the configured market.
 
     Args:
         settings: Exchange, symbol, timeframe, and candle limit.
-        exchange: Optional pre-built CCXT client (useful in tests).
+        exchange: Optional pre-built exchange client (CCXT or BinanceVisionClient).
 
     Returns:
         DataFrame of closed OHLCV candles in UTC.
@@ -160,6 +362,10 @@ def fetch_ohlcv(settings: Settings, exchange: ccxt.Exchange | None = None) -> pd
             "Only an in-progress candle was returned; wait for a closed bar."
         )
 
+    # If extra candles were fetched to guarantee candle_limit after dropping the open bar, slice to target
+    if len(closed) > settings.candle_limit:
+        closed = closed.tail(settings.candle_limit).reset_index(drop=True)
+
     gaps = find_missing_candle_gaps(closed, timeframe_ms)
     if gaps:
         preview = "; ".join(gaps[:5])
@@ -172,7 +378,7 @@ def fetch_ohlcv(settings: Settings, exchange: ccxt.Exchange | None = None) -> pd
 
 
 def _fetch_ohlcv_with_retries(
-    exchange: ccxt.Exchange, settings: Settings
+    exchange: ccxt.Exchange | BinanceVisionClient, settings: Settings
 ) -> list[list[Any]]:
     last_error: Exception | None = None
     for attempt in range(1, MAX_FETCH_ATTEMPTS + 1):
@@ -182,6 +388,9 @@ def _fetch_ohlcv_with_retries(
                 timeframe=settings.timeframe,
                 limit=settings.candle_limit,
             )
+        except MarketDataError:
+            # Re-raise explicit MarketDataErrors immediately without CCXT wraps
+            raise
         except RateLimitExceeded as exc:
             last_error = exc
             if attempt == MAX_FETCH_ATTEMPTS:

@@ -7,7 +7,13 @@ import pytest
 
 from crypto_research.exceptions import RiskFilterError
 from crypto_research.indicators import IndicatorSnapshot
-from crypto_research.risk import PortfolioState, RiskLimits, evaluate_risk
+from crypto_research.risk import (
+    PortfolioState,
+    RiskLimits,
+    convert_directional_signal_to_action,
+    convert_portfolio_action,
+    evaluate_risk,
+)
 from crypto_research.schemas import ScoutProposal, SkepticReview
 
 
@@ -181,3 +187,172 @@ def test_risk_raises_on_empty_candles() -> None:
             snapshot=_snapshot(),
             recent_candles=pd.DataFrame(),
         )
+
+
+def test_risk_rejects_sell_when_no_holdings() -> None:
+    eval_result = evaluate_risk(
+        proposal=_valid_scout("SELL", confidence=0.8),
+        critique=_valid_skeptic("APPROVE", agrees=True),
+        snapshot=_snapshot(100.0),
+        recent_candles=_candles(),
+        portfolio=PortfolioState(cash_usd=10_000.0, current_position_usd=0.0, current_equity_usd=10_000.0),
+    )
+    assert eval_result.passed is False
+    assert eval_result.checks["has_position_to_sell"] is False
+    assert any("no open long position" in r for r in eval_result.rejection_reasons)
+
+
+def test_risk_rejects_buy_when_allocation_limit_reached() -> None:
+    eval_result = evaluate_risk(
+        proposal=_valid_scout("BUY", confidence=0.8),
+        critique=_valid_skeptic("APPROVE", agrees=True),
+        snapshot=_snapshot(100.0),
+        recent_candles=_candles(),
+        portfolio=PortfolioState(
+            cash_usd=9000.0,
+            current_position_usd=1000.0,
+            current_equity_usd=10_000.0,
+        ),
+        limits=RiskLimits(max_portfolio_allocation_pct=0.10),
+    )
+    assert eval_result.passed is False
+    assert eval_result.checks["allocation_capacity_available"] is False
+    assert any("Position allocation limit reached" in r for r in eval_result.rejection_reasons)
+
+
+def test_risk_approves_full_position_size_on_sell_even_if_above_max_position() -> None:
+    # Position has grown to $1500, above the initial $1000 position limit
+    eval_result = evaluate_risk(
+        proposal=_valid_scout("SELL", confidence=0.85),
+        critique=_valid_skeptic("APPROVE", agrees=True),
+        snapshot=_snapshot(150.0),
+        recent_candles=_candles(close=150.0),
+        portfolio=PortfolioState(
+            cash_usd=8500.0,
+            current_position_usd=1500.0,
+            current_equity_usd=10_000.0,
+            bars_since_last_trade=10,
+        ),
+        limits=RiskLimits(max_position_size_usd=1000.0),
+    )
+    assert eval_result.passed is True
+    assert eval_result.approved_size_usd == 1500.0
+    assert eval_result.checks["has_position_to_sell"] is True
+
+
+# =========================================================================
+# Tests for Minimum Order Notional (Part A)
+# =========================================================================
+
+def test_risk_rejects_buy_below_min_trade_size() -> None:
+    # 10% of 10,000 = 1,000. Position is 997.0 -> remaining capacity is 3.0 USD < 10.0 USD
+    eval_result = evaluate_risk(
+        proposal=_valid_scout("BUY", confidence=0.8),
+        critique=_valid_skeptic("APPROVE", agrees=True),
+        snapshot=_snapshot(100.0),
+        recent_candles=_candles(),
+        portfolio=PortfolioState(
+            cash_usd=9000.0,
+            current_position_usd=997.0,
+            current_equity_usd=10_000.0,
+            bars_since_last_trade=10,
+        ),
+        limits=RiskLimits(max_portfolio_allocation_pct=0.10, min_trade_size_usd=10.0),
+    )
+    assert eval_result.passed is False
+    assert eval_result.checks["meets_min_trade_size"] is False
+    assert any("below minimum trade size threshold" in r for r in eval_result.rejection_reasons)
+
+
+def test_risk_accepts_buy_exactly_at_min_trade_size() -> None:
+    # Remaining capacity = 1000 - 990 = 10.0 USD == min_trade_size_usd
+    eval_result = evaluate_risk(
+        proposal=_valid_scout("BUY", confidence=0.8),
+        critique=_valid_skeptic("APPROVE", agrees=True),
+        snapshot=_snapshot(100.0),
+        recent_candles=_candles(),
+        portfolio=PortfolioState(
+            cash_usd=9000.0,
+            current_position_usd=990.0,
+            current_equity_usd=10_000.0,
+            bars_since_last_trade=10,
+        ),
+        limits=RiskLimits(max_portfolio_allocation_pct=0.10, min_trade_size_usd=10.0),
+    )
+    assert eval_result.passed is True
+    assert eval_result.approved_size_usd == 10.0
+    assert eval_result.checks["meets_min_trade_size"] is True
+
+
+def test_risk_accepts_normal_buy() -> None:
+    eval_result = evaluate_risk(
+        proposal=_valid_scout("BUY", confidence=0.85),
+        critique=_valid_skeptic("APPROVE", agrees=True),
+        snapshot=_snapshot(100.0),
+        recent_candles=_candles(),
+        portfolio=PortfolioState(
+            cash_usd=10_000.0,
+            current_position_usd=0.0,
+            current_equity_usd=10_000.0,
+            bars_since_last_trade=10,
+        ),
+        limits=RiskLimits(max_position_size_usd=1000.0, min_trade_size_usd=10.0),
+    )
+    assert eval_result.passed is True
+    assert eval_result.approved_size_usd == 1000.0
+    assert eval_result.checks["meets_min_trade_size"] is True
+
+
+def test_risk_allows_full_liquidation_of_position_below_min_trade_size() -> None:
+    # Residual position worth only 4.50 USD (< 10.0 USD threshold)
+    eval_result = evaluate_risk(
+        proposal=_valid_scout("SELL", confidence=0.85),
+        critique=_valid_skeptic("APPROVE", agrees=True),
+        snapshot=_snapshot(100.0),
+        recent_candles=_candles(),
+        portfolio=PortfolioState(
+            cash_usd=9995.50,
+            current_position_usd=4.50,
+            current_equity_usd=10_000.0,
+            bars_since_last_trade=10,
+        ),
+        limits=RiskLimits(min_trade_size_usd=10.0),
+    )
+    assert eval_result.passed is True
+    assert eval_result.approved_size_usd == 4.50
+    assert eval_result.checks["has_position_to_sell"] is True
+
+
+# =========================================================================
+# Tests for Portfolio-Aware Action Conversion (Part B)
+# =========================================================================
+
+def test_action_conversion_flat_bearish() -> None:
+    assert convert_directional_signal_to_action("SELL", has_open_position=False) == "HOLD"
+    prop = _valid_scout("SELL")
+    converted = convert_portfolio_action(prop, has_open_position=False)
+    assert converted.action == "HOLD"
+    assert "maintaining cash" in converted.thesis
+
+
+def test_action_conversion_long_bearish() -> None:
+    assert convert_directional_signal_to_action("SELL", has_open_position=True) == "SELL"
+    prop = _valid_scout("SELL")
+    converted = convert_portfolio_action(prop, has_open_position=True)
+    assert converted.action == "SELL"
+
+
+def test_action_conversion_flat_bullish() -> None:
+    assert convert_directional_signal_to_action("BUY", has_open_position=False) == "BUY"
+    prop = _valid_scout("BUY")
+    converted = convert_portfolio_action(prop, has_open_position=False)
+    assert converted.action == "BUY"
+
+
+def test_action_conversion_long_bullish() -> None:
+    assert convert_directional_signal_to_action("BUY", has_open_position=True) == "BUY"
+    prop = _valid_scout("BUY")
+    converted = convert_portfolio_action(prop, has_open_position=True)
+    assert converted.action == "BUY"
+
+

@@ -21,7 +21,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
 
-import numpy as np
 import pandas as pd
 
 from crypto_research.config import Settings, load_settings
@@ -55,7 +54,13 @@ from crypto_research.paper_trading import (
     simulate_execution,
 )
 from crypto_research.research import DualAgentResult, run_dual_agents
-from crypto_research.risk import PortfolioState, RiskLimits, evaluate_risk
+from crypto_research.risk import (
+    PortfolioState,
+    RiskLimits,
+    convert_directional_signal_to_action,
+    convert_portfolio_action,
+    evaluate_risk,
+)
 from crypto_research.schemas import ScoutProposal, SkepticReview
 from crypto_research.storage import (
     get_all_positions,
@@ -92,10 +97,14 @@ class DeterministicRuleProvider:
         market_context: dict[str, Any],
         snapshot: IndicatorSnapshot,
         symbol: str,
+        has_open_position: bool | None = None,
     ) -> DualAgentResult:
         sma_fast = snapshot.sma_50
         sma_slow = snapshot.sma_200
         momentum = snapshot.momentum_30d
+
+        if has_open_position is None:
+            has_open_position = bool(market_context.get("has_open_position", False))
 
         if sma_fast > sma_slow and momentum > 0.01:
             proposal = ScoutProposal(
@@ -149,7 +158,8 @@ class DeterministicRuleProvider:
                 confidence=0.70,
             )
 
-        return DualAgentResult(proposal=proposal, critique=critique)
+        raw_result = DualAgentResult(proposal=proposal, critique=critique)
+        return convert_portfolio_action(raw_result, has_open_position=has_open_position)
 
 
 class RecordedDecisionProvider:
@@ -218,6 +228,7 @@ class BacktestReport:
     end_time_utc: str
     initial_equity: float
     final_equity: float
+    total_net_profit_usd: float
     total_return_pct: float
     benchmark_return_pct: float
     max_drawdown_pct: float
@@ -229,9 +240,18 @@ class BacktestReport:
     gross_profit_usd: float
     gross_loss_usd: float
     net_realized_pnl_usd: float
-    unrealized_pnl_usd: float
+    unrealized_pnl_usd: float  # Gross unrealized P&L (market value - purchase cost basis)
+    gross_unrealized_pnl_usd: float
+    net_unrealized_pnl_usd: float  # Net unrealized P&L after accounting for entry fees on open positions
     total_fees_paid_usd: float
+    open_positions_fees_usd: float
     profit_factor: float
+    signals_proposed: int
+    signals_approved: int
+    signals_rejected: int
+    rejections_by_reason: dict[str, int]
+    proposals_by_action: dict[str, int]
+    unexecuted_orders: int
     equity_curve: list[dict[str, Any]]
     symbol_breakdown: dict[str, dict[str, Any]]
     execution_history: list[dict[str, Any]]
@@ -266,11 +286,15 @@ def validate_backtest_candles(
         if frame[col].isna().any():
             raise MarketDataError(f"Non-numeric values in {col} column for {symbol}.")
 
-    ohlc = frame[["open", "high", "low", "close"]].to_numpy()
-    if np.isinf(ohlc).any():
-        raise MarketDataError(f"Non-finite OHLC values found in candle data for {symbol}.")
-    if (ohlc <= 0).any():
-        raise MarketDataError(f"Non-positive OHLC prices found in candle data for {symbol}.")
+    ohlc_cols = ["open", "high", "low", "close"]
+    for col in ohlc_cols:
+        series = frame[col]
+        # Check non-finite without requiring external numpy
+        if series.isin([float("inf"), float("-inf")]).any():
+            raise MarketDataError(f"Non-finite OHLC values found in candle data for {symbol}.")
+        if (series <= 0).any():
+            raise MarketDataError(f"Non-positive OHLC prices found in candle data for {symbol}.")
+
     if (frame["high"] < frame["low"]).any():
         raise MarketDataError(f"Invalid candle with high < low found for {symbol}.")
 
@@ -298,6 +322,7 @@ def run_backtest(
     - Evaluates signals using past closed bars only (no future data leakage).
     - Simulates executions at next-candle open prices with adverse slippage and fees.
     - Isolates virtual portfolio state using account_id f"backtest_{config.run_id}".
+    - Maintains a true running peak of equity for accurate drawdown calculation.
     - Live trading is strictly disabled.
     """
     if not config.symbols:
@@ -360,9 +385,13 @@ def run_backtest(
 
     if config.start_date:
         start_ts = pd.Timestamp(config.start_date)
+        if start_ts.tzinfo is None:
+            start_ts = start_ts.tz_localize("UTC")
         timeline = [t for t in timeline if t >= start_ts]
     if config.end_date:
         end_ts = pd.Timestamp(config.end_date)
+        if end_ts.tzinfo is None:
+            end_ts = end_ts.tz_localize("UTC")
         timeline = [t for t in timeline if t <= end_ts]
 
     if not timeline:
@@ -377,6 +406,16 @@ def run_backtest(
     equity_curve: list[dict[str, Any]] = []
     benchmark_start_prices: dict[str, float] = {}
     benchmark_end_prices: dict[str, float] = {}
+
+    # Signal and risk tracking metrics
+    signals_proposed = 0
+    signals_approved = 0
+    signals_rejected = 0
+    proposals_by_action = {"BUY": 0, "SELL": 0, "HOLD": 0}
+    rejections_by_reason: dict[str, int] = {}
+
+    # Running peak equity tracker for true point-in-time drawdown calculation
+    running_peak_equity = float(config.initial_cash_usd)
 
     settings_dummy = Settings(
         exchange_id="simulated",
@@ -460,12 +499,7 @@ def run_backtest(
             snap = latest_snapshot(aligned_candles)
             market_ctx = build_market_context(settings_dummy, snap, aligned_candles)
 
-            # Retrieve agent decision
-            agent_result = provider(market_ctx, snap, symbol)
-            if not agent_result or agent_result.proposal.action not in ("BUY", "SELL"):
-                continue
-
-            # Load persistent portfolio state for deterministic risk checks
+            # Load persistent portfolio state for deterministic risk checks and inventory awareness
             port_state = load_portfolio_state_from_db(
                 db_conn,
                 symbol=symbol,
@@ -474,6 +508,21 @@ def run_backtest(
                 account_id=account_id,
                 current_price=close_price,
             )
+            has_open_pos = port_state.current_position_usd > 0.0
+            market_ctx["has_open_position"] = has_open_pos
+
+            # Retrieve agent decision
+            agent_result = provider(market_ctx, snap, symbol)
+            if not agent_result:
+                continue
+
+            action = agent_result.proposal.action
+            if action in proposals_by_action:
+                proposals_by_action[action] += 1
+            signals_proposed += 1
+
+            if action not in ("BUY", "SELL"):
+                continue
 
             risk_eval = evaluate_risk(
                 proposal=agent_result.proposal,
@@ -485,6 +534,7 @@ def run_backtest(
             )
 
             if risk_eval.passed:
+                signals_approved += 1
                 cand = create_paper_trade(
                     symbol=symbol,
                     snapshot=snap,
@@ -495,15 +545,45 @@ def run_backtest(
                 log_paper_trade(db_conn, cand)
                 # Queue as pending for execution at NEXT candle open
                 pending_candidates[symbol] = cand
+            else:
+                signals_rejected += 1
+                for reason in risk_eval.rejection_reasons:
+                    # Categorize reason for report breakdown
+                    reason_key = (
+                        "allocation_limit_reached"
+                        if "allocation limit" in reason.lower()
+                        else "below_min_trade_size"
+                        if "below minimum trade size" in reason.lower()
+                        else "cooldown_active"
+                        if "cooldown" in reason.lower()
+                        else "no_holdings_to_sell"
+                        if "no open long position" in reason.lower()
+                        else "insufficient_cash"
+                        if "insufficient cash" in reason.lower()
+                        else reason[:40]
+                    )
+                    rejections_by_reason[reason_key] = (
+                        rejections_by_reason.get(reason_key, 0) + 1
+                    )
 
-        # 3. Record Point-in-Time Portfolio Valuation
+        # 3. Record Point-in-Time Portfolio Valuation & Running Peak Equity
         acc = get_portfolio_account(db_conn, account_id)
         assert acc is not None
         positions = get_all_positions(db_conn, account_id)
         current_equity = calculate_portfolio_equity(acc, positions, current_close_prices)
+
+        # Update running peak equity across daily mark-to-market
+        if current_equity > running_peak_equity:
+            running_peak_equity = current_equity
+            # Persist updated peak equity to SQLite so load_portfolio_state_from_db evaluates risk accurately
+            db_conn.execute(
+                "UPDATE portfolio_accounts SET peak_equity_usd = ? WHERE account_id = ?",
+                (running_peak_equity, account_id),
+            )
+
         drawdown_pct = (
-            max(0.0, (acc.peak_equity_usd - current_equity) / acc.peak_equity_usd)
-            if acc.peak_equity_usd > 0
+            max(0.0, (running_peak_equity - current_equity) / running_peak_equity)
+            if running_peak_equity > 0
             else 0.0
         )
         equity_curve.append(
@@ -511,7 +591,7 @@ def run_backtest(
                 "timestamp_utc": current_ts.isoformat(),
                 "cash_usd": acc.cash_usd,
                 "equity_usd": current_equity,
-                "peak_equity_usd": acc.peak_equity_usd,
+                "peak_equity_usd": running_peak_equity,
                 "drawdown_pct": drawdown_pct,
             }
         )
@@ -522,16 +602,28 @@ def run_backtest(
     final_positions = get_all_positions(db_conn, account_id)
     all_executions = list(reversed(get_paper_executions(db_conn, account_id=account_id, limit=10_000)))
 
-    # Compute unrealized P&L on remaining holdings
-    unrealized_pnl = sum(
+    # Compute gross and net unrealized P&L on remaining holdings
+    gross_unrealized_pnl = sum(
         calculate_unrealized_pnl(pos, benchmark_end_prices.get(pos.symbol, pos.average_entry_price))
         for pos in final_positions
         if pos.quantity > 0
     )
     final_equity = calculate_portfolio_equity(final_account, final_positions, benchmark_end_prices)
-    total_return_pct = (
-        (final_equity - config.initial_cash_usd) / config.initial_cash_usd * 100.0
+    total_net_profit_usd = final_equity - config.initial_cash_usd
+    total_return_pct = (total_net_profit_usd / config.initial_cash_usd) * 100.0
+
+    # Separate entry fees on open positions vs closed trades
+    open_positions_fees_usd = sum(
+        float(pos.quantity * pos.average_entry_price * config.fee_rate)
+        for pos in final_positions
+        if pos.quantity > 0
     )
+    total_buy_fees = sum(float(e["fee_usd"]) for e in all_executions if e["action"] == "BUY")
+    closed_entry_fees_usd = max(0.0, total_buy_fees - open_positions_fees_usd)
+
+    # Net realized P&L accounts for both entry and exit fees
+    net_realized_pnl = final_account.realized_pnl_usd - closed_entry_fees_usd
+    net_unrealized_pnl = gross_unrealized_pnl - open_positions_fees_usd
 
     # Buy-and-Hold Benchmark calculation
     bench_returns: list[float] = []
@@ -544,7 +636,15 @@ def run_backtest(
 
         s_execs = [e for e in all_executions if e["symbol"] == s]
         s_trades = [t for t in completed_trades if t["symbol"] == s]
-        s_realized = sum(t["realized_pnl_usd"] for t in s_trades)
+        s_buy_fees = sum(float(e["fee_usd"]) for e in s_execs if e["action"] == "BUY")
+        s_open_pos = next((p for p in final_positions if p.symbol == s and p.quantity > 0), None)
+        s_open_fee = (
+            float(s_open_pos.quantity * s_open_pos.average_entry_price * config.fee_rate)
+            if s_open_pos
+            else 0.0
+        )
+        s_closed_entry = max(0.0, s_buy_fees - s_open_fee)
+        s_realized = sum(t["realized_pnl_usd"] for t in s_trades) - s_closed_entry
         s_fees = sum(float(e["fee_usd"]) for e in s_execs)
         symbol_breakdown[s] = {
             "executions_count": len(s_execs),
@@ -554,7 +654,9 @@ def run_backtest(
             "benchmark_return_pct": b_ret,
         }
 
-    benchmark_return_pct = float(np.mean(bench_returns)) if bench_returns else 0.0
+    benchmark_return_pct = (
+        float(sum(bench_returns) / len(bench_returns)) if bench_returns else 0.0
+    )
     max_drawdown_pct = max((pt["drawdown_pct"] for pt in equity_curve), default=0.0) * 100.0
 
     # Trade statistics
@@ -580,6 +682,7 @@ def run_backtest(
         end_time_utc=end_time_utc,
         initial_equity=config.initial_cash_usd,
         final_equity=final_equity,
+        total_net_profit_usd=total_net_profit_usd,
         total_return_pct=total_return_pct,
         benchmark_return_pct=benchmark_return_pct,
         max_drawdown_pct=max_drawdown_pct,
@@ -590,10 +693,19 @@ def run_backtest(
         win_rate_pct=win_rate_pct,
         gross_profit_usd=gross_profit_usd,
         gross_loss_usd=gross_loss_usd,
-        net_realized_pnl_usd=final_account.realized_pnl_usd,
-        unrealized_pnl_usd=unrealized_pnl,
+        net_realized_pnl_usd=net_realized_pnl,
+        unrealized_pnl_usd=gross_unrealized_pnl,
+        gross_unrealized_pnl_usd=gross_unrealized_pnl,
+        net_unrealized_pnl_usd=net_unrealized_pnl,
         total_fees_paid_usd=final_account.total_fees_paid_usd,
+        open_positions_fees_usd=open_positions_fees_usd,
         profit_factor=profit_factor,
+        signals_proposed=signals_proposed,
+        signals_approved=signals_approved,
+        signals_rejected=signals_rejected,
+        rejections_by_reason=rejections_by_reason,
+        proposals_by_action=proposals_by_action,
+        unexecuted_orders=len(pending_candidates),
         equity_curve=equity_curve,
         symbol_breakdown=symbol_breakdown,
         execution_history=all_executions,
@@ -601,7 +713,7 @@ def run_backtest(
 
 
 def format_backtest_report(report: BacktestReport) -> str:
-    """Render a human-readable performance and audit report."""
+    """Render a human-readable performance, risk, and accounting audit report."""
     pf_str = (
         "inf (no losses)"
         if math.isinf(report.profit_factor)
@@ -620,21 +732,44 @@ def format_backtest_report(report: BacktestReport) -> str:
         "PORTFOLIO PERFORMANCE & METRICS:",
         f"  Initial Equity:         ${report.initial_equity:,.2f} USD",
         f"  Final Equity:           ${report.final_equity:,.2f} USD",
+        f"  Total Net Profit:       ${report.total_net_profit_usd:+,.2f} USD",
         f"  Total Return:           {report.total_return_pct:+.2f}%",
-        f"  Buy & Hold Benchmark:   {report.benchmark_return_pct:+.2f}%",
-        f"  Max Drawdown:           {report.max_drawdown_pct:.2f}%",
+        f"  Buy & Hold Benchmark:   {report.benchmark_return_pct:+.2f}% (100% asset buy-and-hold)",
+        f"  Max Drawdown:           {report.max_drawdown_pct:.2f}% (from running peak equity)",
         f"  Total Executions:       {report.total_executions}",
-        f"  Completed Trades:       {report.completed_trades}",
+        f"  Completed Trades:       {report.completed_trades} (closed round-trips)",
         f"  Win Rate:               {report.win_rate_pct:.1f}% ({report.winning_trades} wins, {report.losing_trades} losses)",
         f"  Gross Profit:           ${report.gross_profit_usd:,.2f} USD",
         f"  Gross Loss:             ${report.gross_loss_usd:,.2f} USD",
         f"  Net Realized P&L:       ${report.net_realized_pnl_usd:+,.2f} USD",
-        f"  Unrealized P&L:         ${report.unrealized_pnl_usd:+,.2f} USD",
+        f"  Gross Unrealized P&L:   ${report.gross_unrealized_pnl_usd:+,.2f} USD (asset price gain on open positions)",
+        f"  Net Unrealized P&L:     ${report.net_unrealized_pnl_usd:+,.2f} USD (after open position entry fees)",
         f"  Total Trading Fees:     ${report.total_fees_paid_usd:,.2f} USD",
         f"  Profit Factor:          {pf_str}",
         "",
-        "SYMBOL BREAKDOWN:",
+        "SIGNAL & RISK FILTER ACTIVITY:",
+        f"  Signals Proposed:       {report.signals_proposed} ({report.proposals_by_action.get('BUY', 0)} BUY, {report.proposals_by_action.get('SELL', 0)} SELL, {report.proposals_by_action.get('HOLD', 0)} HOLD)",
+        f"  Approved by Risk:       {report.signals_approved}",
+        f"  Rejected by Risk:       {report.signals_rejected}",
     ]
+
+    if report.rejections_by_reason:
+        lines.append("  Rejection Breakdown:")
+        for r_name, count in sorted(report.rejections_by_reason.items(), key=lambda x: -x[1]):
+            lines.append(f"    - {r_name}: {count}")
+
+    lines.extend(
+        [
+            f"  Fills Executed:         {report.total_executions}",
+            f"  Unexecuted (Final Bar): {report.unexecuted_orders}",
+            "",
+            "ACCOUNTING RECONCILIATION:",
+            f"  Final Equity (${report.final_equity:,.2f}) = Initial (${report.initial_equity:,.2f}) + Net Realized (${report.net_realized_pnl_usd:+,.2f}) + Net Unrealized (${report.net_unrealized_pnl_usd:+,.2f})",
+            f"  Net Unrealized (${report.net_unrealized_pnl_usd:+,.2f})  = Gross Unrealized (${report.gross_unrealized_pnl_usd:+,.2f}) - Open Entry Fees (${report.open_positions_fees_usd:,.2f})",
+            "",
+            "SYMBOL BREAKDOWN:",
+        ]
+    )
 
     for sym, stats in report.symbol_breakdown.items():
         lines.append(
@@ -652,7 +787,8 @@ def format_backtest_report(report: BacktestReport) -> str:
             "- Executions simulated at the OPEN price of the bar following signal close.",
             "- Adverse slippage and trading fees are applied to every executed fill.",
             "- In spot long-only mode, shorting is strictly prohibited; sells require holdings.",
-            "- Benchmark is equal-weighted buy-and-hold across tested symbols from period start to end.",
+            "- Benchmark is equal-weighted 100% buy-and-hold across tested symbols from period start to end.",
+            "- Max drawdown tracks running peak portfolio equity across every daily mark-to-market step.",
             "- Profit factor is defined as gross profit divided by gross loss (infinite if zero losses).",
             "",
             "DISCLAIMER:",
@@ -672,7 +808,14 @@ def generate_backtest_candles(
     freq: str = "1D",
     trend: str = "uptrend",
 ) -> pd.DataFrame:
-    """Generate deterministic synthetic OHLCV candles with known properties for network-free testing."""
+    """Generate deterministic synthetic OHLCV candles with known properties for network-free testing.
+
+    Supported trends:
+    - 'uptrend': monotonic positive price trend
+    - 'downtrend': monotonic negative price trend
+    - 'cycle': alternating bull and bear market waves (40 bars up, 20 bars down)
+    - 'sideways': oscillating sine wave
+    """
     timestamps = pd.date_range(start_date, periods=periods, freq=freq, tz="UTC")
     closes = [start_price]
 
@@ -681,6 +824,12 @@ def generate_backtest_candles(
             change = 50.0 + (i % 7) * 10.0 - (i % 5) * 5.0
         elif trend == "downtrend":
             change = -50.0 - (i % 7) * 10.0 + (i % 5) * 5.0
+        elif trend == "cycle":
+            cycle_phase = i % 60
+            if cycle_phase < 40:
+                change = 80.0 + (i % 5) * 15.0
+            else:
+                change = -140.0 - (i % 4) * 20.0
         else:  # sideways
             change = math.sin(i / 10.0) * 100.0
         closes.append(max(100.0, closes[-1] + change))
@@ -756,6 +905,13 @@ def main() -> int:
         help="Run offline using deterministic synthetic candles (network-free, zero API costs).",
     )
     parser.add_argument(
+        "--trend",
+        type=str,
+        default="uptrend",
+        choices=["uptrend", "downtrend", "cycle", "sideways"],
+        help="Market regime trend for synthetic data (default: uptrend).",
+    )
+    parser.add_argument(
         "--csv-file",
         type=str,
         default=None,
@@ -789,10 +945,12 @@ def main() -> int:
 
     try:
         if args.synthetic:
-            print("Using deterministic synthetic candle data (network-free).")
+            print(f"Using deterministic synthetic candle data (trend={args.trend}, network-free).")
             for sym in symbols:
                 candles_by_symbol[sym] = generate_backtest_candles(
-                    symbol=sym, periods=max(300, args.candle_limit), trend="uptrend"
+                    symbol=sym,
+                    periods=max(300, args.candle_limit),
+                    trend=args.trend,
                 )
         elif args.csv_file:
             print(f"Loading candles from CSV: {args.csv_file}")
@@ -800,8 +958,8 @@ def main() -> int:
             for sym in symbols:
                 candles_by_symbol[sym] = df
         else:
-            print("Fetching public historical candles via CCXT...")
             settings = load_settings()
+            print(f"Fetching public historical candles for {symbols} via public exchange API ({settings.exchange_id})...")
             exchange = create_public_exchange(settings.exchange_id)
             for sym in symbols:
                 sym_settings = Settings(

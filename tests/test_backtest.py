@@ -19,7 +19,6 @@ import math
 import sqlite3
 from typing import Any
 
-import numpy as np
 import pandas as pd
 import pytest
 
@@ -400,3 +399,264 @@ def test_deterministic_repeatability_on_identical_runs() -> None:
     assert rep1.completed_trades == rep2.completed_trades
     assert rep1.net_realized_pnl_usd == pytest.approx(rep2.net_realized_pnl_usd)
     assert len(rep1.equity_curve) == len(rep2.equity_curve)
+
+
+# =========================================================================
+# 6. Audit & Validation Regression Tests (Phase 4)
+# =========================================================================
+
+def test_running_peak_equity_and_drawdown_on_open_position_pullback() -> None:
+    """Verifies that running peak equity updates on daily mark-to-market.
+
+    A sharp unrealized pullback during an open position must reflect in max_drawdown_pct
+    even when current equity remains above the initial cash balance.
+    """
+    # 200 bars base at 100.0, then surges to 300.0 by bar 220, then drops to 150.0 by bar 240
+    timestamps = pd.date_range("2024-01-01", periods=250, freq="1D", tz="UTC")
+    closes = [100.0] * 200
+    for i in range(1, 21):
+        closes.append(100.0 + i * 10.0)  # reaches 300.0 at index 220
+    for i in range(1, 21):
+        closes.append(300.0 - i * 7.5)   # drops to 150.0 at index 240
+    closes.extend([150.0] * (250 - len(closes)))
+
+    candles = pd.DataFrame(
+        {
+            "timestamp": timestamps,
+            "open": closes,
+            "high": [c + 1.0 for c in closes],
+            "low": [c - 1.0 for c in closes],
+            "close": closes,
+            "volume": [100.0] * 250,
+        }
+    )
+
+    # Buy signal at bar 200 close, executed at bar 201 open ($110.0)
+    ts_buy = candles.iloc[200]["timestamp"].isoformat()
+    decisions = {
+        ("BTC/USDT", ts_buy): DualAgentResult(
+            proposal=ScoutProposal(action="BUY", confidence=0.9, thesis="Surge", evidence=["Breakout"], risks=["Risk"], missing_data=[]),
+            critique=SkepticReview(verdict="APPROVE", agrees_with_action=True, rationale="Approve", missing_evidence=[], weaknesses=["None"], confidence=0.9),
+        ),
+    }
+
+    config = BacktestConfig(
+        run_id="test_dd_pullback",
+        symbols=["BTC/USDT"],
+        initial_cash_usd=10_000.0,
+        fee_rate=0.001,
+        slippage_pct=0.0,
+        risk_limits=RiskLimits(max_position_size_usd=1_000.0),
+    )
+
+    report = run_backtest(
+        config,
+        candles_by_symbol={"BTC/USDT": candles},
+        decision_provider=RecordedDecisionProvider(decisions),
+    )
+
+    # Max equity was reached around bar 220:
+    # 1000 USD position bought at 110 (~9.09 units), at 300 is worth ~2727 USD.
+    # Total peak equity ~ 9000 cash + 2727 = ~11,727 USD.
+    # At bar 240, position at 150 is worth ~1363 USD -> Total equity ~ 10,363 USD.
+    # Drop from peak = (11,727 - 10,363) / 11,727 = ~11.6%.
+    # Before the fix, peak was frozen at $10,000, so drawdown was reported as 0.00%.
+    assert report.max_drawdown_pct > 10.0
+    assert report.max_drawdown_pct < 15.0
+
+
+def test_exact_cash_holdings_and_unrealized_pnl_reconciliation() -> None:
+    """Verifies that cash, market value, realized P&L, fees, and unrealized P&L reconcile exactly."""
+    candles = generate_backtest_candles("BTC/USDT", periods=250, start_price=50_000.0, trend="uptrend")
+    config = BacktestConfig(
+        run_id="test_reconciliation",
+        symbols=["BTC/USDT"],
+        initial_cash_usd=10_000.0,
+        fee_rate=0.001,
+        slippage_pct=0.0005,
+    )
+
+    report = run_backtest(
+        config,
+        candles_by_symbol={"BTC/USDT": candles},
+        decision_provider=DeterministicRuleProvider(),
+    )
+
+    # 1. Total Net Profit matches equity difference
+    assert report.total_net_profit_usd == pytest.approx(report.final_equity - report.initial_equity, abs=1e-4)
+
+    # 2. Equity equals Initial + Net Realized + Net Unrealized
+    assert report.final_equity == pytest.approx(
+        report.initial_equity + report.net_realized_pnl_usd + report.net_unrealized_pnl_usd,
+        abs=1e-4,
+    )
+
+    # 3. Net Unrealized = Gross Unrealized - Open Position Entry Fees
+    assert report.net_unrealized_pnl_usd == pytest.approx(
+        report.gross_unrealized_pnl_usd - report.open_positions_fees_usd,
+        abs=1e-4,
+    )
+
+    # 4. In a single open trade scenario, open position fees equal total trading fees paid
+    assert report.open_positions_fees_usd == pytest.approx(report.total_fees_paid_usd, abs=1e-4)
+
+
+def test_signal_rejection_tracking_and_allocation_cap() -> None:
+    """Verifies that repetitive signals in a monotonic trend are tracked and rejected once allocation limit is met."""
+    candles = generate_backtest_candles("BTC/USDT", periods=250, start_price=50_000.0, trend="uptrend")
+    config = BacktestConfig(
+        run_id="test_signal_tracking",
+        symbols=["BTC/USDT"],
+        initial_cash_usd=10_000.0,
+        risk_limits=RiskLimits(max_position_size_usd=1_000.0),
+    )
+
+    report = run_backtest(
+        config,
+        candles_by_symbol={"BTC/USDT": candles},
+        decision_provider=DeterministicRuleProvider(),
+    )
+
+    # In a 250-bar uptrend, bars 200..249 produce 50 signals
+    assert report.signals_proposed > 30
+    assert report.proposals_by_action.get("BUY", 0) == report.signals_proposed
+    # Only 1 signal is approved because position limit ($1000) is filled immediately
+    assert report.signals_approved == 1
+    assert report.signals_rejected == report.signals_proposed - 1
+    assert "allocation_limit_reached" in report.rejections_by_reason
+    assert report.rejections_by_reason["allocation_limit_reached"] > 0
+    assert report.total_executions == 1
+    assert report.completed_trades == 0
+
+
+def test_cycle_trend_generates_completed_round_trips() -> None:
+    """Verifies that alternating market cycles trigger both BUY and SELL signals and complete round-trip trades."""
+    candles = generate_backtest_candles("BTC/USDT", periods=360, start_price=50_000.0, trend="cycle")
+    config = BacktestConfig(
+        run_id="test_cycle_trades",
+        symbols=["BTC/USDT"],
+        initial_cash_usd=10_000.0,
+        fee_rate=0.001,
+        slippage_pct=0.0005,
+    )
+
+    report = run_backtest(
+        config,
+        candles_by_symbol={"BTC/USDT": candles},
+        decision_provider=DeterministicRuleProvider(),
+    )
+
+    assert report.total_executions >= 2
+    assert report.completed_trades >= 1
+    assert report.win_rate_pct >= 0.0
+    assert report.profit_factor >= 0.0
+    assert len(report.symbol_breakdown["BTC/USDT"]) > 0
+
+
+def test_sell_rejection_without_inventory() -> None:
+    """Verifies that SELL signals without an existing open position are rejected fail-closed."""
+    candles = _linear_candles(250)
+    ts_sell = candles.iloc[205]["timestamp"].isoformat()
+
+    decisions = {
+        ("BTC/USDT", ts_sell): DualAgentResult(
+            proposal=ScoutProposal(action="SELL", confidence=0.85, thesis="Sell without holdings", evidence=["Trend"], risks=["Risk"], missing_data=[]),
+            critique=SkepticReview(verdict="APPROVE", agrees_with_action=True, rationale="Approve", missing_evidence=[], weaknesses=["None"], confidence=0.85),
+        )
+    }
+
+    config = BacktestConfig(run_id="test_no_inventory", symbols=["BTC/USDT"])
+    report = run_backtest(
+        config,
+        candles_by_symbol={"BTC/USDT": candles},
+        decision_provider=RecordedDecisionProvider(decisions),
+    )
+
+    assert report.total_executions == 0
+    assert report.signals_proposed == 1
+    assert report.signals_approved == 0
+    assert report.signals_rejected == 1
+    assert report.rejections_by_reason.get("no_holdings_to_sell", 0) == 1
+
+
+def test_fee_and_adverse_slippage_accounting_on_round_trip() -> None:
+    """Verifies deterministic fee and adverse slippage math on a full BUY and SELL round-trip."""
+    candles = _linear_candles(250, start_price=100.0, step=1.0)
+    ts_buy = candles.iloc[205]["timestamp"].isoformat()
+    ts_sell = candles.iloc[215]["timestamp"].isoformat()
+
+    decisions = {
+        ("BTC/USDT", ts_buy): DualAgentResult(
+            proposal=ScoutProposal(action="BUY", confidence=0.9, thesis="Buy", evidence=["e"], risks=["r"], missing_data=[]),
+            critique=SkepticReview(verdict="APPROVE", agrees_with_action=True, rationale="ok", missing_evidence=[], weaknesses=["w"], confidence=0.9),
+        ),
+        ("BTC/USDT", ts_sell): DualAgentResult(
+            proposal=ScoutProposal(action="SELL", confidence=0.9, thesis="Sell", evidence=["e"], risks=["r"], missing_data=[]),
+            critique=SkepticReview(verdict="APPROVE", agrees_with_action=True, rationale="ok", missing_evidence=[], weaknesses=["w"], confidence=0.9),
+        ),
+    }
+
+    fee_rate = 0.002       # 0.2%
+    slippage_pct = 0.001   # 0.1%
+    initial_cash = 10_000.0
+    config = BacktestConfig(
+        run_id="test_round_trip_math",
+        symbols=["BTC/USDT"],
+        initial_cash_usd=initial_cash,
+        fee_rate=fee_rate,
+        slippage_pct=slippage_pct,
+        risk_limits=RiskLimits(max_position_size_usd=1_000.0),
+    )
+
+    report = run_backtest(
+        config,
+        candles_by_symbol={"BTC/USDT": candles},
+        decision_provider=RecordedDecisionProvider(decisions),
+    )
+
+    assert report.total_executions == 2
+    assert report.completed_trades == 1
+
+    buy_exec = report.execution_history[0]
+    sell_exec = report.execution_history[1]
+
+    # Buy at Bar 206 Open ($306.0) with +0.1% slippage
+    expected_buy_open = float(candles.iloc[206]["open"])
+    expected_buy_fill = expected_buy_open * (1.0 + slippage_pct)
+    assert buy_exec["execution_price"] == pytest.approx(expected_buy_fill)
+
+    # Sell at Bar 216 Open ($316.0) with -0.1% slippage
+    expected_sell_open = float(candles.iloc[216]["open"])
+    expected_sell_fill = expected_sell_open * (1.0 - slippage_pct)
+    assert sell_exec["execution_price"] == pytest.approx(expected_sell_fill)
+
+    # Fee verification
+    buy_fee = buy_exec["fee_usd"]
+    sell_fee = sell_exec["fee_usd"]
+    assert report.total_fees_paid_usd == pytest.approx(buy_fee + sell_fee)
+
+    # Total net profit matches net realized P&L exactly since 0 open positions remain
+    assert report.unrealized_pnl_usd == 0.0
+    assert report.total_net_profit_usd == pytest.approx(report.net_realized_pnl_usd, abs=1e-4)
+
+
+def test_date_filtering_with_tz_naive_and_tz_aware_strings() -> None:
+    """Verifies that date filtering gracefully handles naive strings without TypeError."""
+    candles = _linear_candles(250, start_date="2024-01-01")
+    config = BacktestConfig(
+        run_id="test_tz_naive",
+        symbols=["BTC/USDT"],
+        start_date="2024-07-01",  # naive string
+        end_date="2024-08-01",    # naive string
+    )
+
+    report = run_backtest(
+        config,
+        candles_by_symbol={"BTC/USDT": candles},
+        decision_provider=RecordedDecisionProvider({}),
+    )
+
+    assert len(report.equity_curve) > 0
+    # First date in equity curve should be >= 2024-07-01
+    assert report.equity_curve[0]["timestamp_utc"] >= "2024-07-01"
+

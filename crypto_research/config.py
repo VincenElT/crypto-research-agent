@@ -27,6 +27,7 @@ MIN_CANDLES_FOR_SMA_200 = 200
 
 DEFAULT_MAX_POSITION_SIZE_USD = 1000.0
 DEFAULT_MAX_PORTFOLIO_ALLOCATION_PCT = 0.10
+DEFAULT_MIN_TRADE_SIZE_USD = 10.0
 DEFAULT_COOLDOWN_BARS = 5
 DEFAULT_MAX_DRAWDOWN_PCT = 0.15
 DEFAULT_MAX_VOLATILITY_PCT = 0.08
@@ -52,6 +53,7 @@ class Settings:
     sqlite_db_path: str = DEFAULT_SQLITE_DB_PATH
     max_position_size_usd: float = DEFAULT_MAX_POSITION_SIZE_USD
     max_portfolio_allocation_pct: float = DEFAULT_MAX_PORTFOLIO_ALLOCATION_PCT
+    min_trade_size_usd: float = DEFAULT_MIN_TRADE_SIZE_USD
     cooldown_bars: int = DEFAULT_COOLDOWN_BARS
     max_drawdown_pct: float = DEFAULT_MAX_DRAWDOWN_PCT
     max_volatility_pct: float = DEFAULT_MAX_VOLATILITY_PCT
@@ -69,6 +71,7 @@ class Settings:
         return RiskLimits(
             max_position_size_usd=self.max_position_size_usd,
             max_portfolio_allocation_pct=self.max_portfolio_allocation_pct,
+            min_trade_size_usd=self.min_trade_size_usd,
             cooldown_bars=self.cooldown_bars,
             max_drawdown_pct=self.max_drawdown_pct,
             max_volatility_pct=self.max_volatility_pct,
@@ -151,6 +154,14 @@ def load_settings(*, dotenv_path: str | None = None) -> Settings:
     if not (0.0 < max_allocation <= 1.0):
         raise ConfigurationError(f"MAX_PORTFOLIO_ALLOCATION_PCT must be in (0, 1], got {max_allocation}.")
 
+    min_trade_size = _parse_float(
+        "MIN_TRADE_SIZE_USD",
+        os.getenv("MIN_TRADE_SIZE_USD", str(DEFAULT_MIN_TRADE_SIZE_USD)),
+        DEFAULT_MIN_TRADE_SIZE_USD,
+    )
+    if min_trade_size < 0:
+        raise ConfigurationError(f"MIN_TRADE_SIZE_USD cannot be negative, got {min_trade_size}.")
+
     cooldown = _parse_int(
         "COOLDOWN_BARS",
         os.getenv("COOLDOWN_BARS", str(DEFAULT_COOLDOWN_BARS)),
@@ -225,6 +236,7 @@ def load_settings(*, dotenv_path: str | None = None) -> Settings:
         sqlite_db_path=os.getenv("SQLITE_DB_PATH", DEFAULT_SQLITE_DB_PATH).strip() or DEFAULT_SQLITE_DB_PATH,
         max_position_size_usd=max_position_size,
         max_portfolio_allocation_pct=max_allocation,
+        min_trade_size_usd=min_trade_size,
         cooldown_bars=cooldown,
         max_drawdown_pct=max_drawdown,
         max_volatility_pct=max_volatility,

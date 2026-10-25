@@ -20,10 +20,18 @@ from crypto_research.schemas import ScoutProposal, SkepticReview
 
 @dataclass(frozen=True)
 class RiskLimits:
-    """Configurable deterministic risk parameters."""
+    """Configurable deterministic risk parameters.
+
+    Note on min_trade_size_usd:
+        Configurable research default minimum notional threshold for BUY orders
+        to prevent execution of micro/dust fills. This is a simulation safeguard,
+        not a guarantee of compatibility with every exchange's current live trading
+        rules (e.g. Binance LOT_SIZE or MIN_NOTIONAL filters).
+    """
 
     max_position_size_usd: float = 1000.0
     max_portfolio_allocation_pct: float = 0.10
+    min_trade_size_usd: float = 10.0
     cooldown_bars: int = 5
     max_drawdown_pct: float = 0.15
     max_volatility_pct: float = 0.08
@@ -214,7 +222,7 @@ def evaluate_risk(
             )
         else:
             checks["has_position_to_sell"] = True
-            approved_size_usd = min(limits.max_position_size_usd, portfolio.current_position_usd)
+            approved_size_usd = portfolio.current_position_usd
             checks["capital_available"] = True
     elif proposal.action == "BUY":
         if portfolio.current_equity_usd > 0:
@@ -235,13 +243,20 @@ def evaluate_risk(
                 target_size_usd = min(limits.max_position_size_usd, remaining_capacity_usd)
                 details["calculated_target_size_usd"] = target_size_usd
 
-                if target_size_usd > portfolio.cash_usd:
+                if target_size_usd < limits.min_trade_size_usd:
+                    checks["meets_min_trade_size"] = False
+                    rejection_reasons.append(
+                        f"Target BUY size {target_size_usd:.2f} USD is below minimum trade size "
+                        f"threshold {limits.min_trade_size_usd:.2f} USD."
+                    )
+                elif target_size_usd > portfolio.cash_usd:
                     checks["capital_available"] = False
                     rejection_reasons.append(
                         f"Insufficient cash ({portfolio.cash_usd:.2f} USD) for target size {target_size_usd:.2f} USD."
                     )
                 else:
                     checks["capital_available"] = True
+                    checks["meets_min_trade_size"] = True
                     approved_size_usd = target_size_usd
 
     if approved_size_usd <= 0.0 and len(rejection_reasons) == 0:
@@ -258,3 +273,58 @@ def evaluate_risk(
         checks=checks,
         details=details,
     )
+
+
+def convert_directional_signal_to_action(
+    action: str,
+    *,
+    has_open_position: bool,
+) -> str:
+    """Convert an unconstrained directional market signal to an executable spot portfolio action.
+
+    Spot Trading Rules:
+    - flat / bearish ('SELL', has_open_position=False) -> 'HOLD'
+    - long / bearish ('SELL', has_open_position=True)  -> 'SELL'
+    - flat / bullish ('BUY',  has_open_position=False) -> 'BUY'
+    - long / bullish ('BUY',  has_open_position=True)  -> 'BUY'
+    - neutral        ('HOLD', any)                     -> 'HOLD'
+    """
+    if action == "SELL" and not has_open_position:
+        return "HOLD"
+    return action
+
+
+def convert_portfolio_action(
+    target: Any,
+    *,
+    has_open_position: bool,
+) -> Any:
+    """Convert a ScoutProposal or DualAgentResult proposed action to an executable spot action."""
+    from crypto_research.research import DualAgentResult
+    from crypto_research.schemas import ScoutProposal
+
+    if isinstance(target, DualAgentResult):
+        converted_proposal = convert_portfolio_action(
+            target.proposal, has_open_position=has_open_position
+        )
+        return DualAgentResult(proposal=converted_proposal, critique=target.critique)
+
+    if isinstance(target, ScoutProposal):
+        action = target.action
+        target_action = convert_directional_signal_to_action(
+            action, has_open_position=has_open_position
+        )
+        if target_action != action:
+            return target.model_copy(
+                update={
+                    "action": target_action,
+                    "thesis": (
+                        f"Flat position in bearish conditions: maintaining cash (converted from {action} to {target_action}). "
+                        f"Underlying thesis: {target.thesis}"
+                    ),
+                }
+            )
+        return target
+
+    return target
+
